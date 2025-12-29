@@ -10,11 +10,13 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import {
   type AgentRole,
+  type AgentStatus,
   type AgentMessage,
   type Result,
   ok,
   err,
   now,
+  generateId,
 } from './types.js';
 
 import * as tmux from './managers/tmux.js';
@@ -53,6 +55,7 @@ import {
   selectStrategy,
   executeRecovery,
   type RecoveryAttempt,
+  registerActionExecutor,
 } from './error-handling.js';
 
 // =============================================================================
@@ -99,20 +102,8 @@ const DEFAULT_CONFIG: Required<OrchestratorConfig> = {
 };
 
 /**
- * Extended agent status for orchestrator management.
- */
-export type AgentStatus =
-  | 'spawning'      // Being created
-  | 'starting'      // tmux pane created, Claude Code starting
-  | 'ready'         // Claude Code running, waiting for input
-  | 'working'       // Processing a task
-  | 'complete'      // Signaled completion
-  | 'blocked'       // Waiting on external input
-  | 'error'         // Encountered an error
-  | 'terminated';   // Shut down
-
-/**
  * Information about an agent managed by the orchestrator.
+ * Note: AgentStatus is imported from types.ts for consistency across modules.
  */
 export interface ManagedAgent {
   role: AgentRole;
@@ -314,6 +305,95 @@ export class Orchestrator {
       ...DEFAULT_CONFIG,
       ...config,
     };
+
+    // Register recovery action executors
+    this.registerRecoveryExecutors();
+  }
+
+  /**
+   * Register action executors for recovery operations.
+   * These handlers are called during error recovery to perform actual work.
+   */
+  private registerRecoveryExecutors(): void {
+    // Respawn agent executor
+    registerActionExecutor('Respawn agent', async (_action, error, _context) => {
+      if (!this.session || !error.agentRole) {
+        return;
+      }
+      const role = error.agentRole as AgentRole;
+
+      // Remove the failed agent
+      const existingAgent = this.session.agents.get(role);
+      if (existingAgent) {
+        try {
+          await this.terminateAgentGracefully(existingAgent);
+        } catch {
+          // Ignore termination errors for crashed agents
+        }
+        this.session.agents.delete(role);
+      }
+
+      // Respawn the agent
+      const spawnResult = await this.spawnAgent(role);
+      if (spawnResult.ok) {
+        if (this._config.verboseLogging) {
+          console.log(`[orchestrator] Recovery: Respawned agent ${role}`);
+        }
+      }
+    });
+
+    // Terminate crashed pane cleanup executor
+    registerActionExecutor('cleanup:Terminate crashed pane', async (_action, error, _context) => {
+      if (!this.session || !error.agentRole) {
+        return;
+      }
+      const role = error.agentRole as AgentRole;
+      const agent = this.session.agents.get(role);
+      if (agent) {
+        try {
+          const sessionName = `swarm_${this.session.id}`;
+          await tmux.killPane(sessionName, agent.paneId);
+          agent.status = 'terminated';
+        } catch {
+          // Pane may already be dead
+        }
+      }
+    });
+
+    // Check for new messages executor
+    registerActionExecutor('Check for new messages', async (_action, error, _context) => {
+      if (!this.session || !error.agentRole) {
+        return;
+      }
+      const role = error.agentRole as AgentRole;
+      const state = this.outboxStates.get(role);
+      if (state) {
+        const newMessages = messageBus.getNewOutboxMessages(role, state.lastReadTimestamp);
+        if (newMessages.length > 0) {
+          if (this._config.verboseLogging) {
+            console.log(`[orchestrator] Recovery: Found ${newMessages.length} new messages from ${role}`);
+          }
+        }
+      }
+    });
+
+    // Send nudge to agent executor
+    registerActionExecutor('Send nudge to agent', async (_action, error, _context) => {
+      if (!this.session || !error.agentRole) {
+        return;
+      }
+      const role = error.agentRole as AgentRole;
+      const agent = this.session.agents.get(role);
+      if (agent) {
+        try {
+          const sessionName = `swarm_${this.session.id}`;
+          // Send a newline to potentially wake up the agent
+          await tmux.sendKeys(sessionName, agent.paneId, '');
+        } catch {
+          // Ignore errors when nudging
+        }
+      }
+    });
   }
 
   // ===========================================================================
@@ -349,8 +429,8 @@ export class Orchestrator {
     // Template is valid, proceed with workflow creation
     void templateResult.value; // Template validated but not used directly
 
-    // Generate session ID if not provided
-    const sessionId = this._config.sessionId || Date.now().toString();
+    // Generate session ID if not provided (use UUID for uniqueness)
+    const sessionId = this._config.sessionId || generateId();
     this._config.sessionId = sessionId;
 
     // Initialize workflow instance
@@ -844,22 +924,7 @@ export class Orchestrator {
       content: message.content,
     });
 
-    // Complete the current step
-    const completeResult = completeStep(
-      this.session.workflowInstance,
-      this.session.workflowInstance.currentStep,
-      {
-        type: message.type,
-        summary: message.content.body.substring(0, 200),
-        verdict: message.content.metadata?.verdict as 'APPROVED' | 'NEEDS_REVISION' | 'REJECTED' | undefined,
-      }
-    );
-
-    if (completeResult.ok) {
-      this.session.workflowInstance = completeResult.value;
-    }
-
-    // Get routing decision from workflow engine
+    // Get routing decision from workflow engine FIRST (before marking step complete)
     const routingResult = engineRouteMessage(this.session.workflowInstance, message);
     if (!routingResult.ok) {
       this.recordError({
@@ -882,8 +947,31 @@ export class Orchestrator {
       await this.applyRoutingDecision(from, decision);
     }
 
+    // Extract and validate verdict from message metadata
+    const rawVerdict = message.content.metadata?.verdict;
+    const validVerdicts = ['APPROVED', 'NEEDS_REVISION', 'REJECTED'] as const;
+    type ValidVerdict = typeof validVerdicts[number];
+    const verdict: ValidVerdict | undefined =
+      typeof rawVerdict === 'string' && validVerdicts.includes(rawVerdict as ValidVerdict)
+        ? (rawVerdict as ValidVerdict)
+        : undefined;
+
+    // Only complete the step AFTER successful routing
+    const completeResult = completeStep(
+      this.session.workflowInstance,
+      this.session.workflowInstance.currentStep,
+      {
+        type: message.type,
+        summary: message.content.body.substring(0, 200),
+        verdict,
+      }
+    );
+
+    if (completeResult.ok) {
+      this.session.workflowInstance = completeResult.value;
+    }
+
     // Transition workflow
-    const verdict = message.content.metadata?.verdict as 'APPROVED' | 'NEEDS_REVISION' | 'REJECTED' | undefined;
     const transitionResult = transitionWorkflow(this.session.workflowInstance, { verdict });
     if (transitionResult.ok) {
       const previousStep = this.session.workflowInstance.currentStep;
@@ -1188,6 +1276,7 @@ export class Orchestrator {
 
   /**
    * Clean up all resources.
+   * Each cleanup step is wrapped in try/catch to prevent cascade failures.
    */
   async cleanup(): Promise<void> {
     this.stopMonitoring();
@@ -1198,22 +1287,64 @@ export class Orchestrator {
 
     const sessionId = this.session.id;
     const sessionName = `swarm_${sessionId}`;
+    const cleanupErrors: Error[] = [];
 
-    // Terminate all agents
+    // Terminate all agents (with error handling per agent)
     for (const agent of this.session.agents.values()) {
-      await this.terminateAgentGracefully(agent);
+      try {
+        await this.terminateAgentGracefully(agent);
+      } catch (error) {
+        cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+        if (this._config.verboseLogging) {
+          console.error(`[orchestrator] Failed to terminate agent ${agent.role}:`, error);
+        }
+      }
     }
 
     // Kill tmux session
-    await tmux.killSession(sessionName);
+    try {
+      await tmux.killSession(sessionName);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+      if (this._config.verboseLogging) {
+        console.error(`[orchestrator] Failed to kill tmux session:`, error);
+      }
+    }
 
     // Remove worktrees
-    await worktree.removeAllWorktrees({ force: true, deleteBranches: true });
-    await worktree.pruneWorktrees();
+    try {
+      await worktree.removeAllWorktrees({ force: true, deleteBranches: true });
+      await worktree.pruneWorktrees();
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+      if (this._config.verboseLogging) {
+        console.error(`[orchestrator] Failed to remove worktrees:`, error);
+      }
+    }
 
     // Clear message queues if autoCleanup
     if (this._config.autoCleanup) {
-      messageBus.clearAllQueues();
+      try {
+        messageBus.clearAllQueues();
+      } catch (error) {
+        cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+        if (this._config.verboseLogging) {
+          console.error(`[orchestrator] Failed to clear message queues:`, error);
+        }
+      }
+    }
+
+    // Update database session status if not already complete/failed
+    try {
+      const currentStatus = this.session.status;
+      if (currentStatus !== 'complete' && currentStatus !== 'failed') {
+        db.updateSessionStatus(sessionId, 'failed');
+      }
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+      if (this._config.verboseLogging) {
+        console.error(`[orchestrator] Failed to update session status in DB:`, error);
+      }
     }
 
     // Emit session ended event
@@ -1222,7 +1353,11 @@ export class Orchestrator {
     }
 
     if (this._config.verboseLogging) {
-      console.log(`[orchestrator] Cleaned up session ${sessionId}`);
+      if (cleanupErrors.length > 0) {
+        console.warn(`[orchestrator] Cleanup completed with ${cleanupErrors.length} error(s)`);
+      } else {
+        console.log(`[orchestrator] Cleaned up session ${sessionId}`);
+      }
     }
   }
 

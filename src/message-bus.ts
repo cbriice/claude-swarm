@@ -502,11 +502,22 @@ export function clearOutbox(agent: string): void {
 }
 
 /**
+ * Tolerance in milliseconds for clock skew between processes.
+ * Messages within this window before the 'since' timestamp will still be included
+ * to account for clock differences between the orchestrator and agents.
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 100;
+
+/**
  * Get outbox messages created after a specific timestamp.
+ * Uses a small tolerance buffer to account for clock skew between processes.
  */
 export function getNewOutboxMessages(agent: string, since: string): AgentMessage[] {
   const sinceDate = new Date(since);
-  return readOutbox(agent).filter(m => new Date(m.timestamp) > sinceDate);
+  // Subtract tolerance to account for clock skew - messages within the tolerance
+  // window before 'since' will be included to prevent missing messages
+  const adjustedSince = sinceDate.getTime() - CLOCK_SKEW_TOLERANCE_MS;
+  return readOutbox(agent).filter(m => new Date(m.timestamp).getTime() > adjustedSince);
 }
 
 // =============================================================================

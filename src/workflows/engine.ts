@@ -541,8 +541,13 @@ export function routeMessage(
     );
   }
 
-  // Extract verdict from message if present
-  const verdict = message.content.metadata?.verdict as ReviewVerdict | undefined;
+  // Extract and validate verdict from message if present
+  const rawVerdict = message.content.metadata?.verdict;
+  const validVerdicts: ReviewVerdict[] = ['APPROVED', 'NEEDS_REVISION', 'REJECTED'];
+  const verdict: ReviewVerdict | undefined =
+    typeof rawVerdict === 'string' && validVerdicts.includes(rawVerdict as ReviewVerdict)
+      ? (rawVerdict as ReviewVerdict)
+      : undefined;
 
   // Determine next step
   const nextStepResult = getNextStep(instance, instance.currentStep, { verdict });

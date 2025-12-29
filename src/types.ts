@@ -86,13 +86,20 @@ export interface AgentInfo {
 /** The five defined agent roles */
 export type AgentRole = 'orchestrator' | 'researcher' | 'developer' | 'reviewer' | 'architect';
 
-/** Agent lifecycle states */
+/**
+ * Agent lifecycle states.
+ * Extended to include all states used by the orchestrator for comprehensive tracking.
+ */
 export type AgentStatus =
-  | 'starting'  // Worktree created, Claude launching
-  | 'running'   // Actively processing
-  | 'complete'  // Sent completion signal
-  | 'error'     // Encountered fatal error
-  | 'idle';     // Waiting for work
+  | 'spawning'      // Being created (worktree creation in progress)
+  | 'starting'      // tmux pane created, Claude Code starting
+  | 'ready'         // Claude Code running, waiting for input
+  | 'idle'          // Waiting for work (ready but not assigned task)
+  | 'working'       // Processing a task
+  | 'blocked'       // Waiting on external input
+  | 'complete'      // Signaled completion
+  | 'error'         // Encountered an error
+  | 'terminated';   // Shut down
 
 // =============================================================================
 // Task Types
