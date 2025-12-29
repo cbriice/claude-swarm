@@ -224,7 +224,3 @@ Role prompts are in `roles/{role}/CLAUDE.md`. Each prompt includes:
 Built on patterns from:
 - [claude-squad](https://github.com/smtg-ai/claude-squad): tmux + git worktrees
 - [claude_code_agent_farm](https://github.com/Dicklesworthstone/claude_code_agent_farm): Parallel agent orchestration
-
-## License
-
-MIT
