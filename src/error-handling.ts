@@ -16,6 +16,71 @@ import {
 import { getDb } from './db.js';
 
 // =============================================================================
+// Safe JSON Utilities
+// =============================================================================
+
+/**
+ * Safely stringify an object, handling circular references and large objects.
+ * Returns a truncated/sanitized version if serialization fails.
+ */
+function safeJsonStringify(obj: unknown, maxLength: number = 1024 * 1024): string {
+  const seen = new WeakSet();
+
+  try {
+    const result = JSON.stringify(obj, (_key, value) => {
+      // Handle circular references
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) {
+          return '[Circular Reference]';
+        }
+        seen.add(value);
+      }
+      // Handle BigInt
+      if (typeof value === 'bigint') {
+        return value.toString();
+      }
+      // Handle functions
+      if (typeof value === 'function') {
+        return '[Function]';
+      }
+      return value;
+    });
+
+    // Truncate if too large
+    if (result.length > maxLength) {
+      return JSON.stringify({
+        _truncated: true,
+        _originalLength: result.length,
+        _message: 'Object too large to serialize fully',
+      });
+    }
+
+    return result;
+  } catch (error) {
+    return JSON.stringify({
+      _serializationError: true,
+      _message: String(error),
+    });
+  }
+}
+
+/**
+ * Safely parse JSON, returning a default value on failure.
+ */
+function safeJsonParse<T>(json: string | null | undefined, defaultValue: T): T {
+  if (!json) {
+    return defaultValue;
+  }
+
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    console.error(`[error-handling] Failed to parse JSON: ${json.substring(0, 100)}...`);
+    return defaultValue;
+  }
+}
+
+// =============================================================================
 // Error Types and Taxonomy
 // =============================================================================
 
@@ -274,6 +339,46 @@ export const EXTERNAL_ERRORS: Record<string, ErrorCodeDefinition> = {
 /**
  * User-related error codes.
  */
+/**
+ * Sensitive keys that should be sanitized from error context.
+ */
+const SENSITIVE_KEYS = [
+  'password',
+  'secret',
+  'token',
+  'key',
+  'credential',
+  'auth',
+  'apikey',
+  'api_key',
+  'api-key',
+  'bearer',
+  'authorization',
+];
+
+/**
+ * Sanitize sensitive data from an object.
+ * Recursively removes or masks values for keys that may contain credentials.
+ */
+function sanitizeContext(context: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(context)) {
+    const lowerKey = key.toLowerCase();
+    const isSensitive = SENSITIVE_KEYS.some(s => lowerKey.includes(s));
+
+    if (isSensitive) {
+      result[key] = '[REDACTED]';
+    } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      result[key] = sanitizeContext(value as Record<string, unknown>);
+    } else {
+      result[key] = value;
+    }
+  }
+
+  return result;
+}
+
 export const USER_ERRORS: Record<string, ErrorCodeDefinition> = {
   INVALID_ARGUMENT: {
     code: 'INVALID_ARGUMENT',
@@ -335,6 +440,9 @@ export function createSwarmError(
 ): SwarmError {
   const definition = ALL_ERROR_CODES[code];
 
+  // Sanitize context to prevent credential leakage
+  const sanitizedContext = options.context ? sanitizeContext(options.context) : undefined;
+
   if (!definition) {
     // Unknown error code, create a generic error
     return {
@@ -351,7 +459,7 @@ export function createSwarmError(
       duration: options.duration,
       recoverable: false,
       retryable: false,
-      context: options.context,
+      context: sanitizedContext,
       cause: options.cause,
       stack: options.stack,
     };
@@ -371,7 +479,7 @@ export function createSwarmError(
     duration: options.duration,
     recoverable: definition.recoverable,
     retryable: definition.retryable,
-    context: options.context,
+    context: sanitizedContext,
     cause: options.cause,
     stack: options.stack,
   };
@@ -484,12 +592,14 @@ export const RETRY_CONFIGS: Record<string, Partial<RetryConfig>> = {
     initialDelayMs: 2000,
   },
   messageSend: {
-    maxRetries: 5,
-    initialDelayMs: 500,
+    maxRetries: 3,            // Reduced from 5 to prevent storm
+    initialDelayMs: 1000,     // Increased from 500ms to reduce storm risk
+    maxDelayMs: 10000,        // Add cap
   },
   databaseWrite: {
     maxRetries: 3,
-    initialDelayMs: 100,
+    initialDelayMs: 200,      // Increased from 100ms
+    maxDelayMs: 5000,
   },
   rateLimited: {
     maxRetries: 5,
@@ -808,6 +918,12 @@ export interface RecoveryOutcome {
 }
 
 /**
+ * Maximum recovery attempts to prevent infinite loops.
+ */
+const MAX_RECOVERY_ATTEMPTS_PER_ERROR = 3;
+const MAX_TOTAL_RECOVERY_ATTEMPTS = 10;
+
+/**
  * Context for recovery operations.
  */
 export interface RecoveryContext {
@@ -816,6 +932,7 @@ export interface RecoveryContext {
   agentStates: Map<string, { status: string; lastActivity: string }>;
   errorHistory: SwarmError[];
   attemptHistory: Map<string, number>;
+  totalAttempts: number;
 }
 
 /**
@@ -848,15 +965,39 @@ export const RECOVERY_STRATEGIES: StrategySelector[] = [
   },
   {
     errorCode: 'AGENT_CRASHED',
+    // Only attempt restart if agent hasn't crashed repeatedly
+    condition: (error, context) => {
+      const crashKey = `AGENT_CRASHED:${error.agentRole}`;
+      const previousCrashes = context.attemptHistory.get(crashKey) ?? 0;
+      // Skip restart if agent has crashed more than twice - likely a persistent issue
+      return previousCrashes < 2;
+    },
     strategy: {
       strategy: 'restart',
       maxAttempts: 2,
       fallbackStrategy: 'skip',
       actions: [
         { type: 'cleanup', description: 'Terminate crashed pane' },
-        { type: 'wait', description: 'Cool-down period', parameters: { ms: 2000 } },
+        { type: 'wait', description: 'Cool-down period', parameters: { ms: 3000 } },  // Increased cool-down
         { type: 'execute', description: 'Respawn agent' },
         { type: 'execute', description: 'Resend last task' },
+      ],
+    },
+  },
+  {
+    // Fallback for agents that keep crashing - skip instead of restart loop
+    errorCode: 'AGENT_CRASHED',
+    condition: (error, context) => {
+      const crashKey = `AGENT_CRASHED:${error.agentRole}`;
+      const previousCrashes = context.attemptHistory.get(crashKey) ?? 0;
+      return previousCrashes >= 2;
+    },
+    strategy: {
+      strategy: 'skip',
+      actions: [
+        { type: 'log', description: 'Agent crash loop detected - skipping agent' },
+        { type: 'notify', description: 'Alert user of persistent crash' },
+        { type: 'cleanup', description: 'Terminate crashed pane' },
       ],
     },
   },
@@ -1127,9 +1268,45 @@ export async function executeRecovery(
   let actionsExecuted = 0;
   let fallbackUsed = false;
 
-  // Update attempt history
+  // Check for infinite loop prevention BEFORE incrementing
   const previousAttempts = context.attemptHistory.get(error.code) ?? 0;
+  const totalAttempts = context.totalAttempts ?? 0;
+
+  if (previousAttempts >= MAX_RECOVERY_ATTEMPTS_PER_ERROR) {
+    return {
+      success: false,
+      strategyUsed: plan.strategy,
+      actionsExecuted: 0,
+      duration: Date.now() - startTime,
+      fallbackUsed: false,
+      finalError: createSwarmError('MAX_ITERATIONS', {
+        message: `Recovery loop detected: ${error.code} failed ${previousAttempts} times`,
+        component: 'recovery',
+        sessionId: context.sessionId,
+        context: { errorCode: error.code, attempts: previousAttempts },
+      }),
+    };
+  }
+
+  if (totalAttempts >= MAX_TOTAL_RECOVERY_ATTEMPTS) {
+    return {
+      success: false,
+      strategyUsed: plan.strategy,
+      actionsExecuted: 0,
+      duration: Date.now() - startTime,
+      fallbackUsed: false,
+      finalError: createSwarmError('MAX_ITERATIONS', {
+        message: `Maximum total recovery attempts (${MAX_TOTAL_RECOVERY_ATTEMPTS}) exceeded`,
+        component: 'recovery',
+        sessionId: context.sessionId,
+        context: { totalAttempts },
+      }),
+    };
+  }
+
+  // Update attempt history
   context.attemptHistory.set(error.code, previousAttempts + 1);
+  context.totalAttempts = totalAttempts + 1;
 
   try {
     // Execute actions
@@ -1560,9 +1737,12 @@ export function createCheckpoint(
 }
 
 /**
- * Save a checkpoint to the database.
+ * Save a checkpoint to the database and auto-prune old checkpoints.
  */
-export async function saveCheckpoint(checkpoint: Checkpoint): Promise<void> {
+export async function saveCheckpoint(
+  checkpoint: Checkpoint,
+  maxCheckpoints: number = DEFAULT_CHECKPOINT_CONFIG.maxCheckpoints
+): Promise<void> {
   const db = getDb();
 
   // Convert Map to object for JSON serialization
@@ -1583,15 +1763,18 @@ export async function saveCheckpoint(checkpoint: Checkpoint): Promise<void> {
       checkpoint.type,
       checkpoint.timestamp,
       checkpoint.createdBy,
-      JSON.stringify(checkpoint.workflowState),
-      JSON.stringify(agentStatesObj),
-      JSON.stringify(checkpoint.messageQueueState),
-      JSON.stringify(checkpoint.completedStages),
-      JSON.stringify(checkpoint.pendingStages),
-      JSON.stringify(checkpoint.errors),
+      safeJsonStringify(checkpoint.workflowState),
+      safeJsonStringify(agentStatesObj),
+      safeJsonStringify(checkpoint.messageQueueState),
+      safeJsonStringify(checkpoint.completedStages),
+      safeJsonStringify(checkpoint.pendingStages),
+      safeJsonStringify(checkpoint.errors),
       checkpoint.notes ?? null,
     ]
   );
+
+  // Auto-prune old checkpoints to prevent unbounded growth
+  await pruneCheckpoints(checkpoint.sessionId, maxCheckpoints);
 }
 
 /**
@@ -1614,11 +1797,13 @@ interface CheckpointRow {
 
 /**
  * Convert a database row to a Checkpoint object.
+ * Uses safe JSON parsing to handle corrupted data gracefully.
  */
 function rowToCheckpoint(row: CheckpointRow): Checkpoint {
-  const agentStatesObj = row.agent_states_json
-    ? JSON.parse(row.agent_states_json) as Record<string, SerializedAgentState>
-    : {};
+  const agentStatesObj = safeJsonParse<Record<string, SerializedAgentState>>(
+    row.agent_states_json,
+    {}
+  );
 
   const agentStates = new Map<string, SerializedAgentState>();
   Object.entries(agentStatesObj).forEach(([key, value]) => {
@@ -1630,15 +1815,16 @@ function rowToCheckpoint(row: CheckpointRow): Checkpoint {
     sessionId: row.session_id,
     timestamp: row.created_at,
     type: row.type as CheckpointType,
-    workflowState: row.workflow_state_json ? JSON.parse(row.workflow_state_json) : {},
+    workflowState: safeJsonParse<Record<string, unknown>>(row.workflow_state_json, {}),
     agentStates,
-    messageQueueState: row.message_queue_json
-      ? JSON.parse(row.message_queue_json)
-      : { inboxes: {}, outboxes: {}, lastProcessedTimestamps: {} },
-    completedStages: row.completed_stages_json ? JSON.parse(row.completed_stages_json) : [],
-    pendingStages: row.pending_stages_json ? JSON.parse(row.pending_stages_json) : [],
+    messageQueueState: safeJsonParse<MessageQueueSnapshot>(
+      row.message_queue_json,
+      { inboxes: {}, outboxes: {}, lastProcessedTimestamps: {} }
+    ),
+    completedStages: safeJsonParse<string[]>(row.completed_stages_json, []),
+    pendingStages: safeJsonParse<string[]>(row.pending_stages_json, []),
     processedMessageIds: [],
-    errors: row.errors_json ? JSON.parse(row.errors_json) : [],
+    errors: safeJsonParse<SwarmError[]>(row.errors_json, []),
     recoveryAttempts: [],
     createdBy: row.created_by as 'auto' | 'manual' | 'error',
     notes: row.notes ?? undefined,

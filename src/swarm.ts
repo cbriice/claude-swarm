@@ -266,6 +266,11 @@ export function printProgress(current: number, total: number, label?: string): v
     return;
   }
 
+  // Guard against division by zero
+  if (total <= 0) {
+    return;
+  }
+
   const width = 20;
   const percent = Math.round((current / total) * 100);
   const filled = Math.round((current / total) * width);
@@ -633,8 +638,23 @@ function setupSignalHandlers(): void {
   });
 
   process.on('SIGTERM', async () => {
+    print('Received SIGTERM, shutting down gracefully...', 'warning');
+
     if (activeOrchestrator) {
-      await activeOrchestrator.stop();
+      try {
+        // Give the orchestrator a reasonable timeout to stop gracefully
+        const stopPromise = activeOrchestrator.stop();
+        const timeoutPromise = new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), 10000)
+        );
+
+        const result = await Promise.race([stopPromise, timeoutPromise]);
+        if (result === null) {
+          print('Graceful shutdown timed out, forcing exit', 'warning');
+        }
+      } catch (error) {
+        print(`Error during SIGTERM shutdown: ${error}`, 'error');
+      }
     }
     process.exit(EXIT_CODES.SUCCESS);
   });

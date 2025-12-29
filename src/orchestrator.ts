@@ -294,6 +294,7 @@ export class Orchestrator {
   private _config: Required<OrchestratorConfig>;
   private recoveryAttempts: RecoveryAttempt[] = [];
   private attemptHistory: Map<string, number> = new Map();
+  private totalRecoveryAttempts: number = 0;
   private swarmErrors: SwarmError[] = [];
 
   // Public readonly properties
@@ -581,6 +582,7 @@ export class Orchestrator {
       agentStates,
       errorHistory: this.swarmErrors,
       attemptHistory: this.attemptHistory,
+      totalAttempts: this.totalRecoveryAttempts,
     };
   }
 
