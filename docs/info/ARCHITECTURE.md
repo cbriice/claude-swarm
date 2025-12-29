@@ -345,7 +345,7 @@ All inter-agent communication uses structured JSON:
                 │ REVISION │                     │ COMPLETE │
                 └──────────┘                     └──────────┘
                       │                                 │
-                      └─────────▶ IN_PROG ◀────────────┘
+                      └─────────▶ IN_PROG              ▼
                                 (if rejected)    (final output)
 ```
 
