@@ -19,6 +19,10 @@ export const ROLES_DIR = 'roles';
 export const BRANCH_PREFIX = 'swarm';
 export const VALID_ROLES: AgentRole[] = ['orchestrator', 'researcher', 'developer', 'reviewer', 'architect'];
 
+// Valid session ID pattern: alphanumeric, underscore, hyphen only (for safe branch names)
+const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30000; // 30 seconds default timeout for git commands
+
 // =============================================================================
 // Type Definitions
 // =============================================================================
@@ -101,11 +105,15 @@ function createWorktreeError(
 
 /**
  * Executes a git command and returns the result.
- * Uses Bun's subprocess API for shell execution.
+ * Uses Bun's subprocess API with optional timeout.
+ * @param args - Command arguments to pass to git
+ * @param cwd - Optional working directory
+ * @param timeoutMs - Optional timeout in milliseconds (default: 30 seconds)
  */
 async function runGit(
   args: string[],
-  cwd?: string
+  cwd?: string,
+  timeoutMs: number = DEFAULT_COMMAND_TIMEOUT_MS
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(['git', ...args], {
     stdout: 'pipe',
@@ -113,11 +121,45 @@ async function runGit(
     cwd,
   });
 
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
-  const exitCode = await proc.exited;
+  // Create a timeout promise
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      proc.kill();
+      reject(new Error(`git command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
 
-  return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+  try {
+    // Race between command completion and timeout
+    const [stdout, stderr, exitCode] = await Promise.race([
+      Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]),
+      timeoutPromise,
+    ]);
+
+    return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+  } catch (error) {
+    // If timeout occurred, return an error result
+    if (error instanceof Error && error.message.includes('timed out')) {
+      return {
+        exitCode: -1,
+        stdout: '',
+        stderr: error.message,
+      };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Validate session ID to prevent git branch name injection.
+ * Only allows alphanumeric, underscore, and hyphen.
+ */
+function validateSessionId(sessionId: string): boolean {
+  return SESSION_ID_PATTERN.test(sessionId);
 }
 
 /**
@@ -349,6 +391,9 @@ export function generateBranchName(role: AgentRole, sessionId: string): string {
   if (!sessionId) {
     throw new Error('sessionId is required');
   }
+  if (!validateSessionId(sessionId)) {
+    throw new Error(`Invalid sessionId '${sessionId}': must contain only alphanumeric, underscore, or hyphen characters`);
+  }
   return `${BRANCH_PREFIX}/${role}-${sessionId}`;
 }
 
@@ -375,9 +420,13 @@ export async function createWorktree(
     return err(createWorktreeError('ROLE_NOT_FOUND', `Invalid role: ${role}`));
   }
 
-  // Validate sessionId is provided
+  // Validate sessionId is provided and safe
   if (!options.sessionId) {
     return err(createWorktreeError('GIT_FAILED', 'sessionId is required'));
+  }
+
+  if (!validateSessionId(options.sessionId)) {
+    return err(createWorktreeError('GIT_FAILED', `Invalid sessionId '${options.sessionId}': must contain only alphanumeric, underscore, or hyphen characters`));
   }
 
   // Validate repository
@@ -466,9 +515,13 @@ export async function createWorktrees(
   roles: AgentRole[],
   options: { sessionId: string; baseBranch?: string }
 ): Promise<Result<Map<AgentRole, string>, WorktreeError>> {
-  // Validate sessionId is provided
+  // Validate sessionId is provided and safe
   if (!options.sessionId) {
     return err(createWorktreeError('GIT_FAILED', 'sessionId is required'));
+  }
+
+  if (!validateSessionId(options.sessionId)) {
+    return err(createWorktreeError('GIT_FAILED', `Invalid sessionId '${options.sessionId}': must contain only alphanumeric, underscore, or hyphen characters`));
   }
 
   const createdWorktrees = new Map<AgentRole, string>();
@@ -634,13 +687,23 @@ export async function removeWorktree(
 }
 
 /**
+ * Result of removing all worktrees with detailed failure information.
+ */
+export interface RemoveAllResult {
+  successCount: number;
+  failedRoles: Array<{ role: AgentRole; error: string }>;
+}
+
+/**
  * Remove all swarm worktrees.
+ * Returns detailed information about both successful and failed removals.
  */
 export async function removeAllWorktrees(
   options?: { force?: boolean; deleteBranches?: boolean }
-): Promise<Result<number, WorktreeError>> {
+): Promise<Result<RemoveAllResult, WorktreeError>> {
   const worktrees = await listWorktrees();
-  let count = 0;
+  let successCount = 0;
+  const failedRoles: Array<{ role: AgentRole; error: string }> = [];
 
   for (const worktree of worktrees) {
     const result = await removeWorktree(worktree.role, {
@@ -649,11 +712,16 @@ export async function removeAllWorktrees(
     });
 
     if (result.ok) {
-      count++;
+      successCount++;
+    } else {
+      failedRoles.push({
+        role: worktree.role,
+        error: result.error.message,
+      });
     }
   }
 
-  return ok(count);
+  return ok({ successCount, failedRoles });
 }
 
 /**
@@ -899,12 +967,23 @@ export async function cleanupSwarmBranches(): Promise<number> {
 }
 
 /**
- * Full cleanup: all worktrees, branches, and empty directories.
+ * Full cleanup result with detailed information.
  */
-export async function fullCleanup(): Promise<{ worktrees: number; branches: number }> {
+export interface FullCleanupResult {
+  worktreesRemoved: number;
+  branchesRemoved: number;
+  failedWorktrees: Array<{ role: AgentRole; error: string }>;
+}
+
+/**
+ * Full cleanup: all worktrees, branches, and empty directories.
+ * Returns detailed information about the cleanup process.
+ */
+export async function fullCleanup(): Promise<FullCleanupResult> {
   // Remove all worktrees
   const worktreeResult = await removeAllWorktrees({ force: true, deleteBranches: true });
-  const worktreesRemoved = worktreeResult.ok ? worktreeResult.value : 0;
+  const worktreesRemoved = worktreeResult.ok ? worktreeResult.value.successCount : 0;
+  const failedWorktrees = worktreeResult.ok ? worktreeResult.value.failedRoles : [];
 
   // Cleanup any orphaned branches
   const branchesRemoved = await cleanupSwarmBranches();
@@ -928,7 +1007,7 @@ export async function fullCleanup(): Promise<{ worktrees: number; branches: numb
     }
   }
 
-  return { worktrees: worktreesRemoved, branches: branchesRemoved };
+  return { worktreesRemoved, branchesRemoved, failedWorktrees };
 }
 
 /**

@@ -124,6 +124,10 @@ const DEFAULT_WAIT_LINES = 50;
 const DEFAULT_PROMPT_TIMEOUT_MS = 30000;
 const DEFAULT_PROMPT_PATTERN = /[$#>%]\s*$/m;
 const DEFAULT_ORPHAN_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+const DEFAULT_COMMAND_TIMEOUT_MS = 30000; // 30 seconds default timeout for tmux commands
+
+// Valid pane ID pattern: %N where N is a number
+const PANE_ID_PATTERN = /^%\d+$/;
 
 // =============================================================================
 // Internal Helpers
@@ -177,19 +181,50 @@ function parsePaneLine(line: string): TmuxPane | null {
 
 /**
  * Executes a tmux command and returns the result.
- * Uses Bun's $ for shell execution.
+ * Uses Bun's subprocess API with optional timeout.
+ * @param args - Command arguments to pass to tmux
+ * @param timeoutMs - Optional timeout in milliseconds (default: 30 seconds)
  */
-async function runTmux(args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function runTmux(
+  args: string[],
+  timeoutMs: number = DEFAULT_COMMAND_TIMEOUT_MS
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(['tmux', ...args], {
     stdout: 'pipe',
     stderr: 'pipe',
   });
 
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
-  const exitCode = await proc.exited;
+  // Create a timeout promise
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      proc.kill();
+      reject(new Error(`tmux command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
 
-  return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+  try {
+    // Race between command completion and timeout
+    const [stdout, stderr, exitCode] = await Promise.race([
+      Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]),
+      timeoutPromise,
+    ]);
+
+    return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+  } catch (error) {
+    // If timeout occurred, return an error result
+    if (error instanceof Error && error.message.includes('timed out')) {
+      return {
+        exitCode: -1,
+        stdout: '',
+        stderr: error.message,
+      };
+    }
+    throw error;
+  }
 }
 
 /**
@@ -215,6 +250,14 @@ function validatePath(path: string): boolean {
   // Reject shell metacharacters
   const dangerous = /[;&|`$(){}[\]<>\\'"!#*?~\n\r]/;
   return !dangerous.test(path);
+}
+
+/**
+ * Validate pane ID to prevent injection attacks.
+ * Pane IDs must match the pattern %N where N is a number.
+ */
+function validatePaneId(paneId: string): boolean {
+  return PANE_ID_PATTERN.test(paneId);
 }
 
 // =============================================================================
@@ -486,10 +529,16 @@ export async function getPane(
  * Focus a specific pane.
  */
 export async function selectPane(
-  sessionName: string,
+  _sessionName: string,
   paneId: string
 ): Promise<Result<void, TmuxError>> {
-  const result = await runTmux(['select-pane', '-t', `${sessionName}:${paneId}`]);
+  // Validate pane ID to prevent injection
+  if (!validatePaneId(paneId)) {
+    return err(createTmuxError('COMMAND_FAILED', `Invalid pane ID '${paneId}': must match pattern %N`));
+  }
+
+  // Use global pane ID directly - tmux determines session from it
+  const result = await runTmux(['select-pane', '-t', paneId]);
 
   if (result.exitCode !== 0) {
     if (result.stderr.includes("can't find pane")) {
@@ -505,10 +554,16 @@ export async function selectPane(
  * Close a specific pane.
  */
 export async function killPane(
-  sessionName: string,
+  _sessionName: string,
   paneId: string
 ): Promise<Result<void, TmuxError>> {
-  const result = await runTmux(['kill-pane', '-t', `${sessionName}:${paneId}`]);
+  // Validate pane ID to prevent injection
+  if (!validatePaneId(paneId)) {
+    return err(createTmuxError('COMMAND_FAILED', `Invalid pane ID '${paneId}': must match pattern %N`));
+  }
+
+  // Use global pane ID directly - tmux determines session from it
+  const result = await runTmux(['kill-pane', '-t', paneId]);
 
   if (result.exitCode !== 0) {
     if (result.stderr.includes("can't find pane")) {
@@ -528,12 +583,18 @@ export async function killPane(
  * Send keystrokes to a pane.
  */
 export async function sendKeys(
-  sessionName: string,
+  _sessionName: string,
   paneId: string,
   text: string,
   options?: SendKeysOptions
 ): Promise<Result<void, TmuxError>> {
-  const target = `${sessionName}:${paneId}`;
+  // Validate pane ID to prevent injection
+  if (!validatePaneId(paneId)) {
+    return err(createTmuxError('COMMAND_FAILED', `Invalid pane ID '${paneId}': must match pattern %N`));
+  }
+
+  // Use global pane ID directly - tmux determines session from it
+  const target = paneId;
   const enter = options?.enter ?? true;
   const literal = options?.literal ?? false;
 
@@ -580,10 +641,16 @@ export async function runCommand(
  * Send Ctrl+C to interrupt running process.
  */
 export async function sendInterrupt(
-  sessionName: string,
+  _sessionName: string,
   paneId: string
 ): Promise<Result<void, TmuxError>> {
-  const target = `${sessionName}:${paneId}`;
+  // Validate pane ID to prevent injection
+  if (!validatePaneId(paneId)) {
+    return err(createTmuxError('COMMAND_FAILED', `Invalid pane ID '${paneId}': must match pattern %N`));
+  }
+
+  // Use global pane ID directly - tmux determines session from it
+  const target = paneId;
   const result = await runTmux(['send-keys', '-t', target, 'C-c']);
 
   if (result.exitCode !== 0) {
@@ -614,11 +681,17 @@ export async function clearPane(
  * Read content from a pane's screen buffer.
  */
 export async function capturePane(
-  sessionName: string,
+  _sessionName: string,
   paneId: string,
   options?: CaptureOptions
 ): Promise<Result<string, TmuxError>> {
-  const target = `${sessionName}:${paneId}`;
+  // Validate pane ID to prevent injection
+  if (!validatePaneId(paneId)) {
+    return err(createTmuxError('COMMAND_FAILED', `Invalid pane ID '${paneId}': must match pattern %N`));
+  }
+
+  // Use global pane ID directly - tmux determines session from it
+  const target = paneId;
   const args: string[] = ['capture-pane', '-t', target, '-p'];
 
   if (options?.startLine !== undefined && options?.endLine !== undefined) {
@@ -822,11 +895,17 @@ export async function applyLayout(
  * Change pane dimensions.
  */
 export async function resizePane(
-  sessionName: string,
+  _sessionName: string,
   paneId: string,
   options: ResizeOptions
 ): Promise<Result<void, TmuxError>> {
-  const target = `${sessionName}:${paneId}`;
+  // Validate pane ID to prevent injection
+  if (!validatePaneId(paneId)) {
+    return err(createTmuxError('COMMAND_FAILED', `Invalid pane ID '${paneId}': must match pattern %N`));
+  }
+
+  // Use global pane ID directly - tmux determines session from it
+  const target = paneId;
 
   if (options.width !== undefined) {
     const result = await runTmux(['resize-pane', '-t', target, '-x', options.width.toString()]);
@@ -887,24 +966,55 @@ export function getAttachCommand(sessionName: string): string {
 // =============================================================================
 
 /**
- * Destroy all swarm sessions.
+ * Result of killing all swarm sessions with detailed failure information.
  */
-export async function killAllSwarmSessions(): Promise<void> {
+export interface KillAllResult {
+  successCount: number;
+  failedSessions: Array<{ name: string; error: string }>;
+}
+
+/**
+ * Destroy all swarm sessions.
+ * Returns detailed information about both successful and failed kills.
+ */
+export async function killAllSwarmSessions(): Promise<KillAllResult> {
   const sessions = await listSwarmSessions();
+  let successCount = 0;
+  const failedSessions: Array<{ name: string; error: string }> = [];
+
   for (const session of sessions) {
-    await killSession(session.name);
+    const result = await killSession(session.name);
+    if (result.ok) {
+      successCount++;
+    } else {
+      failedSessions.push({
+        name: session.name,
+        error: result.error.message,
+      });
+    }
   }
+
+  return { successCount, failedSessions };
+}
+
+/**
+ * Result of cleanup orphaned sessions with detailed information.
+ */
+export interface CleanupOrphanedResult {
+  successCount: number;
+  failedSessions: Array<{ name: string; error: string }>;
 }
 
 /**
  * Remove old swarm sessions.
- * Returns count of killed sessions.
+ * Returns detailed information about the cleanup process.
  */
-export async function cleanupOrphanedSessions(maxAgeMs?: number): Promise<number> {
+export async function cleanupOrphanedSessions(maxAgeMs?: number): Promise<CleanupOrphanedResult> {
   const threshold = maxAgeMs ?? DEFAULT_ORPHAN_MAX_AGE_MS;
   const sessions = await listSwarmSessions();
   const now = Date.now();
-  let count = 0;
+  let successCount = 0;
+  const failedSessions: Array<{ name: string; error: string }> = [];
 
   for (const session of sessions) {
     // Parse timestamp from session name "swarm_{timestamp}"
@@ -912,11 +1022,18 @@ export async function cleanupOrphanedSessions(maxAgeMs?: number): Promise<number
     if (match) {
       const created = parseInt(match[1], 10);
       if (now - created > threshold) {
-        await killSession(session.name);
-        count++;
+        const result = await killSession(session.name);
+        if (result.ok) {
+          successCount++;
+        } else {
+          failedSessions.push({
+            name: session.name,
+            error: result.error.message,
+          });
+        }
       }
     }
   }
 
-  return count;
+  return { successCount, failedSessions };
 }
