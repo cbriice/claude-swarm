@@ -14,7 +14,6 @@ import {
   type Result,
   ok,
   err,
-  generateId,
   now,
 } from './types.js';
 
@@ -25,7 +24,6 @@ import * as db from './db.js';
 
 import {
   type WorkflowInstance,
-  type WorkflowTemplate,
   getWorkflowTemplate,
   createWorkflowInstance,
   isWorkflowComplete,
@@ -34,16 +32,28 @@ import {
 import {
   startStep,
   completeStep,
-  failStep,
   transitionWorkflow,
   createInitialTaskMessage,
   routeMessage as engineRouteMessage,
   synthesizeResult as engineSynthesizeResult,
   getWorkflowProgress,
   getActiveAgents,
-  type WorkflowResult,
   type RoutingDecision,
 } from './workflows/engine.js';
+
+import {
+  createSwarmError,
+  type SwarmError,
+  withRetry,
+  RETRY_CONFIGS,
+  checkpointOnStage,
+  type SerializedAgentState,
+  type MessageQueueSnapshot,
+  type RecoveryContext,
+  selectStrategy,
+  executeRecovery,
+  type RecoveryAttempt,
+} from './error-handling.js';
 
 // =============================================================================
 // Type Definitions
@@ -282,6 +292,9 @@ export class Orchestrator {
   private outboxStates: Map<AgentRole, OutboxState> = new Map();
   private sessionErrors: SessionError[] = [];
   private _config: Required<OrchestratorConfig>;
+  private recoveryAttempts: RecoveryAttempt[] = [];
+  private attemptHistory: Map<string, number> = new Map();
+  private swarmErrors: SwarmError[] = [];
 
   // Public readonly properties
   public get sessionId(): string {
@@ -332,7 +345,8 @@ export class Orchestrator {
       return err(createOrchestratorError('SYSTEM_ERROR', 'Goal cannot be empty'));
     }
 
-    const template = templateResult.value;
+    // Template is valid, proceed with workflow creation
+    void templateResult.value; // Template validated but not used directly
 
     // Generate session ID if not provided
     const sessionId = this._config.sessionId || Date.now().toString();
@@ -540,14 +554,81 @@ export class Orchestrator {
     return this.session !== null && this.session.status === 'running';
   }
 
+  /**
+   * Get recovery context for error recovery operations.
+   * Used by the error-handling module to make recovery decisions.
+   */
+  getRecoveryContext(): RecoveryContext {
+    const agentStates = new Map<string, { status: string; lastActivity: string }>();
+
+    if (this.session) {
+      for (const [role, agent] of this.session.agents) {
+        agentStates.set(role, {
+          status: agent.status,
+          lastActivity: agent.lastActivityAt,
+        });
+      }
+    }
+
+    return {
+      sessionId: this.sessionId,
+      workflowState: this.session?.workflowInstance
+        ? {
+            currentStep: this.session.workflowInstance.currentStep,
+            status: this.session.workflowInstance.status,
+          }
+        : undefined,
+      agentStates,
+      errorHistory: this.swarmErrors,
+      attemptHistory: this.attemptHistory,
+    };
+  }
+
   // ===========================================================================
   // Agent Management
   // ===========================================================================
 
   /**
-   * Spawn a single agent.
+   * Spawn a single agent with retry logic.
    */
   async spawnAgent(role: AgentRole): Promise<Result<ManagedAgent, OrchestratorError>> {
+    // Use withRetry for resilient agent spawning
+    const retryConfig = { ...RETRY_CONFIGS.agentSpawn };
+    const retryResult = await withRetry<ManagedAgent>(
+      async (context) => {
+        if (this._config.verboseLogging && context.attempt > 1) {
+          console.log(`[orchestrator] Retry ${context.attempt}/${context.maxAttempts} spawning agent ${role}`);
+        }
+
+        const result = await this.doSpawnAgent(role);
+        if (!result.ok) {
+          // Convert OrchestratorError to throw for retry handling
+          throw new Error(result.error.message);
+        }
+        return result.value;
+      },
+      retryConfig,
+      `spawn_${role}`
+    );
+
+    if (retryResult.success && retryResult.result) {
+      return ok(retryResult.result);
+    }
+
+    // All retries exhausted, return the last error
+    const lastError = retryResult.errors[retryResult.errors.length - 1];
+    return err(
+      createOrchestratorError(
+        'AGENT_SPAWN_FAILED',
+        `Failed to spawn agent ${role} after ${retryResult.attempts} attempts: ${lastError?.message ?? 'Unknown error'}`
+      )
+    );
+  }
+
+  /**
+   * Internal implementation of agent spawning (used by spawnAgent with retry).
+   */
+  private async doSpawnAgent(role: AgentRole): Promise<Result<ManagedAgent, OrchestratorError>> {
     if (!this.session) {
       return err(createOrchestratorError('SESSION_NOT_FOUND', 'No session is running'));
     }
@@ -813,6 +894,9 @@ export class Orchestrator {
           to: this.session.workflowInstance.currentStep,
         });
 
+        // Checkpoint the completed stage for recovery
+        await this.createStageCheckpoint(previousStep);
+
         // Start the new step
         const newStepResult = startStep(
           this.session.workflowInstance,
@@ -886,7 +970,7 @@ export class Orchestrator {
   }
 
   /**
-   * Check agent health.
+   * Check agent health and execute recovery if needed.
    */
   async checkAgentHealth(role: AgentRole): Promise<AgentStatus> {
     if (!this.session) {
@@ -908,14 +992,56 @@ export class Orchestrator {
     const lastActivity = new Date(agent.lastActivityAt).getTime();
     if (Date.now() - lastActivity > this._config.agentTimeout) {
       agent.status = 'error';
+
+      // Create a SwarmError for proper error handling integration
+      const swarmError = createSwarmError('AGENT_TIMEOUT', {
+        message: `Agent ${role} timed out after ${this._config.agentTimeout}ms`,
+        component: 'orchestrator',
+        sessionId: this.session.id,
+        agentRole: role,
+        context: {
+          timeout: this._config.agentTimeout,
+          lastActivity: agent.lastActivityAt,
+        },
+      });
+
+      // Track the error
+      this.swarmErrors.push(swarmError);
+
+      // Record in session errors for backward compatibility
       this.recordError({
         timestamp: now(),
         agent: role,
         type: 'timeout',
-        message: `Agent ${role} timed out`,
-        recoverable: true,
+        message: swarmError.message,
+        recoverable: swarmError.recoverable,
         recovered: false,
       });
+
+      // Execute recovery using error-handling module
+      const recoveryContext = this.getRecoveryContext();
+      const recoveryPlan = selectStrategy(swarmError, recoveryContext);
+      const recoveryOutcome = await executeRecovery(swarmError, recoveryPlan, recoveryContext);
+
+      // Track recovery attempt
+      this.recoveryAttempts.push({
+        errorId: swarmError.id,
+        strategy: recoveryOutcome.strategyUsed,
+        outcome: recoveryOutcome.success ? 'success' : 'failed',
+        timestamp: now(),
+      });
+
+      if (recoveryOutcome.success) {
+        // Mark error as recovered in session errors
+        const sessionError = this.sessionErrors.find(e => e.message === swarmError.message);
+        if (sessionError) {
+          sessionError.recovered = true;
+        }
+
+        if (this._config.verboseLogging) {
+          console.log(`[orchestrator] Recovery successful for agent ${role} using strategy: ${recoveryOutcome.strategyUsed}`);
+        }
+      }
     }
 
     return agent.status;
@@ -1258,7 +1384,7 @@ export class Orchestrator {
     }
 
     // Check each agent
-    for (const [role, agent] of this.session.agents) {
+    for (const [role] of this.session.agents) {
       // Capture output
       if (this._config.captureOutput) {
         await this.captureAgentOutput(role);
@@ -1416,6 +1542,90 @@ export class Orchestrator {
 
     if (this._config.verboseLogging) {
       console.error(`[orchestrator] Error: ${error.message}`);
+    }
+  }
+
+  /**
+   * Create a checkpoint after a stage completes.
+   */
+  private async createStageCheckpoint(stageName: string): Promise<void> {
+    if (!this.session) {
+      return;
+    }
+
+    try {
+      // Build serialized agent states
+      const agentStates = new Map<string, SerializedAgentState>();
+      for (const [role, agent] of this.session.agents) {
+        agentStates.set(role, {
+          role,
+          status: agent.status,
+          messageCount: agent.messageCount,
+          lastActivityAt: agent.lastActivityAt,
+        });
+      }
+
+      // Build message queue snapshot
+      const queueSummary = messageBus.getQueueSummary();
+      const messageQueueState: MessageQueueSnapshot = {
+        inboxes: {},
+        outboxes: {},
+        lastProcessedTimestamps: {},
+      };
+      for (const [agent, counts] of Object.entries(queueSummary)) {
+        messageQueueState.inboxes[agent] = counts.inbox;
+        messageQueueState.outboxes[agent] = counts.outbox;
+        const outboxState = this.outboxStates.get(agent as AgentRole);
+        if (outboxState) {
+          messageQueueState.lastProcessedTimestamps[agent] = outboxState.lastReadTimestamp;
+        }
+      }
+
+      // Get completed and pending stages from workflow step history
+      const completedStages = this.session.workflowInstance.stepHistory
+        .filter((record) => record.status === 'complete')
+        .map((record) => record.stepId);
+
+      // Get all step IDs from the workflow template
+      const templateResult = getWorkflowTemplate(this.session.workflowType);
+      let allStages: string[] = [];
+      if (templateResult.ok) {
+        allStages = templateResult.value.steps.map((step) => step.id);
+      }
+
+      const pendingStages = allStages.filter((stepId) => !completedStages.includes(stepId));
+
+      // Convert SwarmErrors to serializable format
+      const errorsForCheckpoint = this.swarmErrors.map((e) => ({
+        ...e,
+        // Remove non-serializable fields
+        context: e.context ? JSON.parse(JSON.stringify(e.context)) : undefined,
+      }));
+
+      await checkpointOnStage(this.session.id, stageName, {
+        workflowState: {
+          currentStep: this.session.workflowInstance.currentStep,
+          status: this.session.workflowInstance.status,
+          workflowType: this.session.workflowType,
+          goal: this.session.goal,
+        },
+        agentStates,
+        messageQueueState,
+        completedStages,
+        pendingStages,
+        processedMessageIds: [],
+        errors: errorsForCheckpoint,
+        recoveryAttempts: this.recoveryAttempts,
+      });
+
+      if (this._config.verboseLogging) {
+        console.log(`[orchestrator] Created checkpoint for stage: ${stageName}`);
+      }
+    } catch (error) {
+      // Log but don't fail the workflow on checkpoint errors
+      if (this._config.verboseLogging) {
+        console.error(`[orchestrator] Failed to create checkpoint: ${error}`);
+      }
     }
   }
 

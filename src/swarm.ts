@@ -1097,11 +1097,11 @@ async function handleMessages(args: ParsedArgs): Promise<number> {
 
 /**
  * Handle the 'stop' command.
+ * Uses orchestrator cleanup for graceful shutdown, falls back to tmux kill.
  */
 async function handleStop(args: ParsedArgs): Promise<number> {
-  // Timeout for graceful shutdown (reserved for future implementation)
-  const _timeout = (args.options['timeout'] as number) || 10000;
-  void _timeout; // Suppress unused warning
+  const timeout = (args.options['timeout'] as number) || 10000;
+  const saveState = args.options['save'] !== false;
 
   // Find active session
   const sessions = await tmux.listSwarmSessions();
@@ -1111,12 +1111,52 @@ async function handleStop(args: ParsedArgs): Promise<number> {
   }
 
   const sessionName = sessions[0].name;
+  const sessionId = sessionName.replace('swarm_', '');
   print(`Stopping session ${sessionName}...`);
 
-  // Kill tmux session
+  // Try to use orchestrator for graceful cleanup
+  // This allows proper agent termination, result synthesis, and state saving
+  try {
+    // If there's an active orchestrator in this process, use it
+    if (activeOrchestrator && activeOrchestrator.sessionId === sessionId) {
+      print('Using active orchestrator for graceful shutdown...', 'info');
+
+      const stopResult = await Promise.race([
+        activeOrchestrator.stop(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), timeout)),
+      ]);
+
+      if (stopResult !== null && stopResult.ok) {
+        print('Session stopped gracefully.', 'success');
+        if (saveState && stopResult.value) {
+          print(`Duration: ${Math.round(stopResult.value.duration / 1000)}s`, 'info');
+        }
+        return EXIT_CODES.SUCCESS;
+      }
+
+      // Graceful stop timed out or failed, fall through to force kill
+      print('Graceful shutdown timed out, forcing stop...', 'warning');
+    }
+  } catch (error) {
+    // Orchestrator cleanup failed, fall through to direct tmux kill
+    if (config.verbose) {
+      print(`Orchestrator cleanup failed: ${error}`, 'debug');
+    }
+  }
+
+  // Fallback: Kill tmux session directly
+  // This is used when we can't access the orchestrator instance
   const result = await tmux.killSession(sessionName);
   if (!result.ok) {
     throw createCLIError('system', `Failed to stop session: ${result.error.message}`, EXIT_CODES.WORKFLOW_FAILED);
+  }
+
+  // Clean up worktrees and message queues when using direct kill
+  try {
+    messageBus.clearAllQueues();
+    print('Cleared message queues.', 'debug');
+  } catch {
+    // Ignore cleanup errors
   }
 
   print('Session stopped.', 'success');
@@ -1370,7 +1410,6 @@ function defineCommands(): Map<string, Command> {
     arguments: [],
     options: [
       { name: 'session', short: 's', description: 'Specific session ID to attach', type: 'string' },
-      { name: 'readonly', short: 'r', description: 'Read-only attachment', type: 'boolean', default: false },
     ],
     examples: [
       'bun swarm.ts attach',

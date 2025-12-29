@@ -7,7 +7,6 @@
 
 import {
   type Result,
-  type AgentRole,
   ok,
   err,
   generateId,
@@ -261,6 +260,14 @@ export const EXTERNAL_ERRORS: Record<string, ErrorCodeDefinition> = {
     message: 'Network connection failed',
     recoverable: true,
     retryable: true,
+  },
+  CIRCUIT_OPEN: {
+    code: 'CIRCUIT_OPEN',
+    category: 'EXTERNAL_ERROR',
+    severity: 'warning',
+    message: 'Circuit breaker is open, operation blocked',
+    recoverable: true,
+    retryable: false,
   },
 };
 
@@ -1019,12 +1026,43 @@ export function shouldContinueRecovery(
 }
 
 /**
+ * Callback type for executing custom recovery operations.
+ */
+export type RecoveryActionExecutor = (
+  action: RecoveryAction,
+  error: SwarmError,
+  context: RecoveryContext
+) => Promise<void>;
+
+/**
+ * Registry for custom action executors.
+ */
+const actionExecutors: Map<string, RecoveryActionExecutor> = new Map();
+
+/**
+ * Register a custom action executor.
+ * Use this to register handlers for 'execute' and 'cleanup' action types.
+ */
+export function registerActionExecutor(
+  actionDescription: string,
+  executor: RecoveryActionExecutor
+): void {
+  actionExecutors.set(actionDescription, executor);
+}
+
+/**
  * Execute a single recovery action.
+ * This function handles the concrete execution of recovery actions:
+ * - wait: Delays for specified milliseconds
+ * - log: Logs the error to the database
+ * - notify: Emits a notification event (console for now)
+ * - execute: Runs a registered executor or logs intent
+ * - cleanup: Runs cleanup executor or logs intent
  */
 export async function executeAction(
   action: RecoveryAction,
-  _error: SwarmError,
-  _context: RecoveryContext
+  error: SwarmError,
+  context: RecoveryContext
 ): Promise<void> {
   switch (action.type) {
     case 'wait': {
@@ -1032,18 +1070,48 @@ export async function executeAction(
       await delay(ms);
       break;
     }
-    case 'log':
-      // Logging is handled by the caller
+
+    case 'log': {
+      // Log the error to the database for persistence
+      await logError(error);
       break;
-    case 'notify':
-      // Notification is handled by the caller
+    }
+
+    case 'notify': {
+      // Emit notification - in the future this could integrate with external systems
+      const message = `[Recovery] ${action.description}: ${error.code} - ${error.message}`;
+      if (error.agentRole) {
+        console.log(`[notify] Agent ${error.agentRole}: ${message}`);
+      } else {
+        console.log(`[notify] ${message}`);
+      }
       break;
-    case 'execute':
-      // Execution is handled by the caller based on description
+    }
+
+    case 'execute': {
+      // Check if there's a registered executor for this action
+      const executor = actionExecutors.get(action.description);
+      if (executor) {
+        await executor(action, error, context);
+      } else {
+        // Log the intent for actions without registered executors
+        // This allows the orchestrator to handle specific actions
+        console.log(`[execute] Recovery action: ${action.description}`);
+      }
       break;
-    case 'cleanup':
-      // Cleanup is handled by the caller
+    }
+
+    case 'cleanup': {
+      // Check if there's a registered cleanup executor
+      const cleanupExecutor = actionExecutors.get(`cleanup:${action.description}`);
+      if (cleanupExecutor) {
+        await cleanupExecutor(action, error, context);
+      } else {
+        // Log cleanup intent
+        console.log(`[cleanup] Recovery cleanup: ${action.description}`);
+      }
       break;
+    }
   }
 }
 
@@ -1211,7 +1279,7 @@ export function createDegradationState(): DegradationState {
  */
 export function canContinue(
   error: SwarmError,
-  workflowState: Record<string, unknown>,
+  _workflowState: Record<string, unknown>,
   degradation: DegradationState
 ): boolean {
   // Fatal errors cannot continue
@@ -1752,6 +1820,10 @@ export async function canRecover(sessionId: string): Promise<boolean> {
 
 /**
  * Recover a session from a checkpoint.
+ * This function restores the full session state including:
+ * - Workflow state and progress
+ * - Agent states (for respawning if needed)
+ * - Message queue state (for resuming message processing)
  */
 export async function recoverSession(
   sessionId: string,
@@ -1793,12 +1865,70 @@ export async function recoverSession(
     }
   }
 
-  // Build restored state
+  // Build agent restoration info
+  const agentsToRestore: Record<string, SerializedAgentState> = {};
+  const agentsToReset: string[] = [];
+
+  checkpoint.agentStates.forEach((state, role) => {
+    if (options.resetAgents) {
+      // Mark all agents for fresh restart
+      agentsToReset.push(role);
+      warnings.push(`Agent ${role} will be restarted fresh`);
+    } else if (state.status === 'error' || state.status === 'terminated') {
+      // Mark failed agents for restart
+      agentsToReset.push(role);
+      warnings.push(`Agent ${role} was in '${state.status}' state and will be restarted`);
+    } else {
+      // Restore agent state
+      agentsToRestore[role] = state;
+    }
+  });
+
+  // Build message queue restoration info
+  let messageQueueState: MessageQueueSnapshot | null = null;
+  if (options.preserveMessages) {
+    messageQueueState = checkpoint.messageQueueState;
+  } else {
+    warnings.push('Message queues will be cleared (preserveMessages=false)');
+  }
+
+  // Build restored state with full recovery information
   const restoredState: Record<string, unknown> = {
+    // Workflow state
     ...checkpoint.workflowState,
     completedStages: checkpoint.completedStages,
     pendingStages: checkpoint.pendingStages.filter(s => !skippedStages.includes(s)),
+
+    // Agent restoration info
+    agentsToRestore,
+    agentsToReset,
+
+    // Message queue restoration info
+    messageQueueState: options.preserveMessages ? messageQueueState : null,
+
+    // Recovery metadata
+    recoveryMetadata: {
+      checkpointId: checkpoint.id,
+      checkpointTimestamp: checkpoint.timestamp,
+      checkpointType: checkpoint.type,
+      previousErrors: checkpoint.errors.length,
+      previousRecoveryAttempts: checkpoint.recoveryAttempts.length,
+    },
+
+    // Processed message IDs for deduplication
+    processedMessageIds: checkpoint.processedMessageIds,
   };
+
+  // Log successful recovery preparation
+  const recoveryLogMessage = [
+    `Prepared recovery from checkpoint ${checkpoint.id}`,
+    `Completed stages: ${checkpoint.completedStages.length}`,
+    `Pending stages: ${restoredState.pendingStages as string[]}`,
+    `Agents to restore: ${Object.keys(agentsToRestore).length}`,
+    `Agents to reset: ${agentsToReset.length}`,
+  ].join(', ');
+
+  console.log(`[recovery] ${recoveryLogMessage}`);
 
   return {
     success: true,
@@ -2058,24 +2188,25 @@ export function getSuggestions(error: SwarmError): string[] {
  */
 export function getRemediationSteps(error: SwarmError): string[] {
   const steps: string[] = [];
+  let stepNumber = 1;
 
   if (error.recoverable) {
-    steps.push('1. Review the error details above');
+    steps.push(`${stepNumber++}. Review the error details above`);
 
     if (error.retryable) {
-      steps.push('2. Wait a few seconds');
-      steps.push('3. Retry the operation');
+      steps.push(`${stepNumber++}. Wait a few seconds`);
+      steps.push(`${stepNumber++}. Retry the operation`);
     }
 
     const suggestions = getSuggestions(error);
-    suggestions.forEach((s, i) => {
-      steps.push(`${steps.length + 1}. ${s}`);
+    suggestions.forEach((s) => {
+      steps.push(`${stepNumber++}. ${s}`);
     });
   } else {
-    steps.push('1. This error cannot be automatically recovered');
-    steps.push('2. Review the error details');
-    steps.push('3. Address the underlying cause');
-    steps.push('4. Restart the session');
+    steps.push(`${stepNumber++}. This error cannot be automatically recovered`);
+    steps.push(`${stepNumber++}. Review the error details`);
+    steps.push(`${stepNumber++}. Address the underlying cause`);
+    steps.push(`${stepNumber++}. Restart the session`);
   }
 
   return steps;
