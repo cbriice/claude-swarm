@@ -1,0 +1,38 @@
+# Runtime state (regenerated each session)
+.swarm/
+
+# Git worktrees (managed by git)
+.worktrees/
+
+# Generated outputs
+outputs/
+
+# Execution logs
+logs/
+
+# Dependencies
+node_modules/
+
+# Lock file (optional to include)
+bun.lockb
+
+# Environment secrets
+.env
+.env.local
+.env*.local
+
+# IDE directories
+.idea/
+.vscode/
+
+# Editor temp files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# TypeScript build info
+*.tsbuildinfo
