@@ -342,3 +342,315 @@ Review received from reviewer
 - Track blockers and escalate if progress stalls
 - Keep tasks small and focused for easier review
 - Provide clear context with each task assignment
+
+---
+
+## Shared Memory & Database Access
+
+The swarm maintains a shared SQLite database at `.swarm/memory.db` for informed decision-making.
+
+### Querying Research Findings
+
+Base designs on researched facts:
+
+```bash
+# Get all high-confidence findings
+sqlite3 .swarm/memory.db "SELECT claim, sources, confidence FROM findings WHERE confidence='high' ORDER BY created_at DESC"
+
+# Find findings relevant to your design area
+sqlite3 .swarm/memory.db "SELECT claim, methodology FROM findings WHERE claim LIKE '%microservices%' OR claim LIKE '%scalability%'"
+
+# Check for contradicting evidence
+sqlite3 .swarm/memory.db "SELECT claim, contradicting_evidence FROM findings WHERE contradicting_evidence IS NOT NULL"
+```
+
+### Tracking Previous Decisions
+
+Maintain consistency with prior architectural choices:
+
+```bash
+# View all decisions made this session
+sqlite3 .swarm/memory.db "SELECT decision, rationale, alternatives FROM decisions ORDER BY created_at DESC"
+
+# Check for constraints that affect new designs
+sqlite3 .swarm/memory.db "SELECT decision, constraints FROM decisions WHERE domain='database' OR domain='api'"
+
+# Avoid contradicting previous decisions
+sqlite3 .swarm/memory.db "SELECT * FROM decisions WHERE decision LIKE '%authentication%'"
+```
+
+### Monitoring Implementation Progress (Delegator Mode)
+
+```bash
+# Track task completion status
+sqlite3 .swarm/memory.db "SELECT description, status, assigned_to FROM tasks WHERE session_id='current-session' ORDER BY created_at"
+
+# Count completed vs remaining tasks
+sqlite3 .swarm/memory.db "SELECT status, COUNT(*) FROM tasks GROUP BY status"
+
+# Find blocked tasks
+sqlite3 .swarm/memory.db "SELECT description, blocker FROM tasks WHERE status='blocked'"
+
+# View revision cycles per task (detect thrashing)
+sqlite3 .swarm/memory.db "SELECT thread_id, COUNT(*) as revisions FROM messages WHERE type='review' AND verdict='NEEDS_REVISION' GROUP BY thread_id"
+```
+
+### Database Schema Reference
+
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `findings` | Research inputs | claim, confidence, sources |
+| `decisions` | Your decisions | decision, rationale, alternatives, constraints |
+| `tasks` | Work assignments | description, status, assigned_to, blocker |
+| `artifacts` | Created outputs | file_path, agent, status |
+| `messages` | Communication log | from_agent, to_agent, type, thread_id |
+
+---
+
+## Error Handling & Recovery
+
+### When Research Is Insufficient
+
+If you need more information before designing:
+
+```json
+{
+  "type": "task",
+  "to": "researcher",
+  "priority": "high",
+  "content": {
+    "subject": "Task: Additional research needed",
+    "body": "Need more information before proceeding with design.",
+    "metadata": {
+      "research_gaps": ["Performance characteristics of Option A vs B", "Security implications of approach X"],
+      "blocking": "Cannot recommend approach without this data",
+      "deadline": "Needed before design phase can complete"
+    }
+  },
+  "requiresResponse": true
+}
+```
+
+### When Developer Is Blocked
+
+If a developer cannot proceed with assigned task:
+
+```json
+{
+  "type": "result",
+  "priority": "high",
+  "content": {
+    "subject": "Decision: task-123 - reassign",
+    "metadata": {
+      "task_id": "task-123",
+      "decision": "reassign",
+      "rationale": "Original task too complex - splitting into smaller units",
+      "next_action": {
+        "type": "task_split",
+        "new_tasks": [
+          { "description": "Implement data layer only", "dependencies": [] },
+          { "description": "Add API endpoints", "dependencies": ["task-123a"] },
+          { "description": "Add validation logic", "dependencies": ["task-123a"] }
+        ]
+      }
+    }
+  }
+}
+```
+
+### When Review Cycles Exceed Threshold
+
+If a task has been revised too many times:
+
+```json
+{
+  "type": "status",
+  "priority": "high",
+  "content": {
+    "subject": "Status: escalation - excessive revision cycles",
+    "body": "Task 'implement-auth' has gone through 4 revision cycles without approval.",
+    "metadata": {
+      "status": "escalation",
+      "task_id": "task-auth-001",
+      "revision_count": 4,
+      "recurring_issues": ["Null handling", "Error messages"],
+      "recommendation": "Pair developer with reviewer for sync discussion OR redesign task scope",
+      "options": [
+        "Force approve with known limitations documented",
+        "Reassign to different developer",
+        "Split task further",
+        "Pause and clarify requirements"
+      ]
+    }
+  },
+  "requiresResponse": true
+}
+```
+
+### When Design Conflicts Arise
+
+If your design conflicts with prior decisions or constraints:
+
+```json
+{
+  "type": "question",
+  "priority": "normal",
+  "content": {
+    "subject": "Design conflict: need resolution",
+    "body": "Proposed approach conflicts with existing decision. Need guidance.",
+    "metadata": {
+      "conflict": {
+        "existing_decision": "Use PostgreSQL for all persistent data",
+        "proposed_change": "Use Redis for session storage",
+        "reason": "Performance requirements for session access"
+      },
+      "options": [
+        "Amend original decision to allow Redis for sessions",
+        "Keep PostgreSQL and optimize queries",
+        "Hybrid approach with caching layer"
+      ],
+      "recommendation": "Option 1 - Redis is standard for session storage"
+    }
+  },
+  "requiresResponse": true
+}
+```
+
+---
+
+## Workflow Continuity with threadId
+
+In Delegator Mode, `threadId` is critical for tracking multi-step implementations.
+
+### Example: Full Implementation Cycle
+
+**Step 1: Receive specification**
+```json
+{
+  "id": "spec-001",
+  "threadId": "project-user-mgmt",
+  "type": "task",
+  "content": {
+    "subject": "Implement user management system",
+    "metadata": { "spec_file": "docs/user-mgmt-spec.md" }
+  }
+}
+```
+
+**Step 2: Decompose and assign first task (same threadId family)**
+```json
+{
+  "id": "task-001",
+  "threadId": "project-user-mgmt:task-1",
+  "to": "developer",
+  "type": "task",
+  "content": {
+    "subject": "Task: Implement User model and database schema",
+    "metadata": {
+      "task_id": "task-001",
+      "acceptance_criteria": ["User table with required fields", "Migration script", "Basic CRUD operations"]
+    }
+  }
+}
+```
+
+**Step 3: Receive review for task (linked threadId)**
+```json
+{
+  "id": "review-001",
+  "threadId": "project-user-mgmt:task-1",
+  "from": "reviewer",
+  "type": "review",
+  "content": {
+    "metadata": { "verdict": "APPROVED" }
+  }
+}
+```
+
+**Step 4: Decision and next task assignment**
+```json
+{
+  "id": "decision-001",
+  "threadId": "project-user-mgmt",
+  "type": "result",
+  "content": {
+    "subject": "Decision: task-001 - approve and proceed",
+    "metadata": {
+      "decision": "approve",
+      "task_queue_status": { "completed": 1, "remaining": 4 },
+      "next_action": {
+        "type": "next_task",
+        "target_agent": "developer"
+      }
+    }
+  }
+}
+```
+
+### Tracking Project Progress
+
+```bash
+# View all tasks for a project
+sqlite3 .swarm/memory.db "SELECT task_id, description, status FROM tasks WHERE thread_id LIKE 'project-user-mgmt%' ORDER BY created_at"
+
+# View approval/revision decisions
+sqlite3 .swarm/memory.db "SELECT task_id, decision, rationale FROM messages WHERE thread_id='project-user-mgmt' AND type='result'"
+
+# Calculate completion percentage
+sqlite3 .swarm/memory.db "SELECT
+  (SELECT COUNT(*) FROM tasks WHERE thread_id LIKE 'project-user-mgmt%' AND status='complete') * 100.0 /
+  (SELECT COUNT(*) FROM tasks WHERE thread_id LIKE 'project-user-mgmt%') as completion_pct"
+```
+
+---
+
+## Complete Delegator Workflow Example
+
+```
+1. RECEIVE SPECIFICATION
+   Check inbox → spec with threadId: "project-api-v2"
+
+2. ANALYZE SPEC
+   - Identify all deliverables
+   - Map dependencies between components
+   - Estimate task count
+
+3. CHECK PRIOR CONTEXT
+   # Get research findings
+   sqlite3 .swarm/memory.db "SELECT claim, confidence FROM findings"
+
+   # Get existing decisions/constraints
+   sqlite3 .swarm/memory.db "SELECT decision, constraints FROM decisions"
+
+4. CREATE TASK QUEUE
+   Decompose spec into 5-10 discrete tasks
+   Order by dependencies
+   Identify parallel opportunities
+
+5. ASSIGN FIRST TASK
+   Send task message to developer
+   threadId: "project-api-v2:task-1"
+
+6. MONITOR CYCLE
+   For each task:
+   a. Developer submits artifact
+   b. Route to reviewer (or auto-route via orchestrator)
+   c. Receive review verdict
+   d. Make decision:
+      - APPROVED → mark complete, assign next
+      - NEEDS_REVISION → send revision instructions
+      - REJECTED → reassess task, possibly split
+
+7. TRACK PROGRESS
+   Maintain task_queue_status in all decision messages
+   Watch for blocked tasks or excessive revisions
+
+8. INTEGRATION CHECK
+   After all tasks complete:
+   - Request integration review
+   - Verify all pieces work together
+
+9. COMPLETION
+   Send status: complete to orchestrator
+   Include summary of tasks completed, artifacts created
+```

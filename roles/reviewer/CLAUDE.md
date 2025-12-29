@@ -210,3 +210,285 @@ If you need more information to complete a review:
 - If you're unsure, ask for clarification rather than guessing
 - Document your verification steps so others can follow your reasoning
 - Remember: the goal is quality output, not blocking progress
+
+---
+
+## Shared Memory & Database Access
+
+The swarm maintains a shared SQLite database at `.swarm/memory.db` for cross-referencing during reviews.
+
+### Verifying Research Claims
+
+Cross-reference researcher findings against sources:
+
+```bash
+# Get researcher findings with sources
+sqlite3 .swarm/memory.db "SELECT claim, confidence, sources, methodology FROM findings ORDER BY created_at DESC"
+
+# Find specific finding to verify
+sqlite3 .swarm/memory.db "SELECT * FROM findings WHERE id='finding-abc123'"
+
+# Check if claim was already verified
+sqlite3 .swarm/memory.db "SELECT * FROM findings WHERE claim LIKE '%rate limit%' AND verified=1"
+```
+
+### Checking Implementation Against Spec
+
+```bash
+# Get architectural decisions the code should follow
+sqlite3 .swarm/memory.db "SELECT decision, rationale, constraints FROM decisions"
+
+# View task requirements for the artifact being reviewed
+sqlite3 .swarm/memory.db "SELECT description, acceptance_criteria FROM tasks WHERE id='task-xyz'"
+```
+
+### Tracking Review History
+
+```bash
+# Check if this artifact was previously reviewed
+sqlite3 .swarm/memory.db "SELECT verdict, issues_found FROM messages WHERE type='review' AND thread_id='feature-auth'"
+
+# Count revision cycles (detect thrashing)
+sqlite3 .swarm/memory.db "SELECT COUNT(*) as revisions FROM messages WHERE thread_id='feature-auth' AND type IN ('review', 'result')"
+```
+
+### Database Schema Reference
+
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `findings` | Research to verify | claim, confidence, sources, verified |
+| `artifacts` | Code to review | file_path, agent, description |
+| `decisions` | Design constraints | decision, rationale, constraints |
+| `messages` | Review history | from_agent, type, verdict, thread_id |
+| `tasks` | Original requirements | description, acceptance_criteria |
+
+---
+
+## Error Handling & Recovery
+
+### When Source URLs Are Inaccessible
+
+If you cannot verify a researcher's sources:
+
+```json
+{
+  "type": "review",
+  "content": {
+    "metadata": {
+      "verdict": "NEEDS_REVISION",
+      "issues_found": [
+        {
+          "severity": "medium",
+          "location": "Finding: API rate limits",
+          "issue": "Source URL returns 404 - cannot verify claim",
+          "suggestion": "Provide alternative source or downgrade confidence to 'low'"
+        }
+      ],
+      "verification_checks": ["Attempted to access https://example.com/docs - returned 404"]
+    }
+  }
+}
+```
+
+### When Code Cannot Be Executed
+
+If tests or code fail to run in your environment:
+
+```json
+{
+  "type": "question",
+  "priority": "normal",
+  "content": {
+    "subject": "Review blocked: cannot execute tests",
+    "body": "Unable to run test suite - dependency installation failed. Need environment clarification.",
+    "metadata": {
+      "blocker_type": "environment",
+      "error": "npm ERR! peer dep missing: typescript@^5.0.0",
+      "attempted": ["npm install", "npm ci", "checked package-lock.json"],
+      "needed": "Correct Node/npm version or fixed dependencies"
+    }
+  },
+  "requiresResponse": true
+}
+```
+
+### When Review Scope Is Unclear
+
+```json
+{
+  "type": "question",
+  "content": {
+    "subject": "Review scope clarification needed",
+    "body": "Received 15 files for review. Should I review all files or focus on specific components?",
+    "metadata": {
+      "files_received": 15,
+      "options": ["Full review of all files", "Focus on core logic only", "Security review only"]
+    }
+  },
+  "requiresResponse": true
+}
+```
+
+### Handling Repeated Revision Cycles
+
+If the same issues keep appearing after multiple revisions:
+
+```json
+{
+  "type": "review",
+  "priority": "high",
+  "content": {
+    "metadata": {
+      "verdict": "REJECTED",
+      "issues_found": [
+        {
+          "severity": "high",
+          "issue": "Same null handling bug reappeared - third revision cycle",
+          "suggestion": "Escalate to architect for task redesign"
+        }
+      ],
+      "escalation_reason": "Revision count exceeded threshold without resolution",
+      "recommendation": "Task may need to be split or requirements clarified"
+    }
+  }
+}
+```
+
+---
+
+## Workflow Continuity with threadId
+
+The `threadId` field links your review to the original submission. **Always include threadId from the artifact you're reviewing.**
+
+### Example: Review with Revision Cycle
+
+**Step 1: Receive artifact for review**
+```json
+{
+  "id": "artifact-001",
+  "threadId": "feature-payment-api",
+  "from": "developer",
+  "type": "artifact",
+  "content": {
+    "subject": "Implementation: Payment processing service",
+    "artifacts": ["src/services/payment.ts"]
+  }
+}
+```
+
+**Step 2: Submit review (same threadId)**
+```json
+{
+  "id": "review-001",
+  "threadId": "feature-payment-api",
+  "type": "review",
+  "content": {
+    "subject": "Review: Payment processing - NEEDS_REVISION",
+    "metadata": {
+      "verdict": "NEEDS_REVISION",
+      "target": "src/services/payment.ts",
+      "issues_found": [
+        {
+          "severity": "high",
+          "location": "line 45",
+          "issue": "Credit card number logged in plaintext",
+          "suggestion": "Mask all but last 4 digits before logging"
+        }
+      ],
+      "verification_checks": ["Ran test suite - 12/12 passing", "Security scan completed"]
+    }
+  }
+}
+```
+
+**Step 3: Receive revision (same threadId)**
+```json
+{
+  "id": "result-001",
+  "threadId": "feature-payment-api",
+  "from": "developer",
+  "type": "result",
+  "content": {
+    "subject": "Revision: Payment service - masked card logging",
+    "metadata": {
+      "issues_fixed": ["Card numbers now masked to last 4 digits"]
+    }
+  }
+}
+```
+
+**Step 4: Submit final review (same threadId)**
+```json
+{
+  "id": "review-002",
+  "threadId": "feature-payment-api",
+  "type": "review",
+  "content": {
+    "subject": "Review: Payment processing - APPROVED",
+    "metadata": {
+      "verdict": "APPROVED",
+      "verification_checks": ["Verified card masking works", "Re-ran security scan - clean"],
+      "positive_feedback": ["Good error handling", "Comprehensive test coverage"]
+    }
+  }
+}
+```
+
+### Querying Review Thread History
+
+```bash
+# View full review cycle
+sqlite3 .swarm/memory.db "SELECT from_agent, type, subject FROM messages WHERE thread_id='feature-payment-api' ORDER BY created_at"
+
+# Check revision count before reviewing
+sqlite3 .swarm/memory.db "SELECT COUNT(*) FROM messages WHERE thread_id='feature-payment-api' AND type='result'"
+```
+
+---
+
+## Complete Review Workflow Example
+
+```
+1. CHECK INBOX
+   cat .swarm/messages/inbox/reviewer.json
+   → Receive artifact with threadId: "feature-auth-v2"
+
+2. GATHER CONTEXT
+   # Get original task requirements
+   sqlite3 .swarm/memory.db "SELECT acceptance_criteria FROM tasks WHERE thread_id='feature-auth-v2'"
+
+   # Get relevant research findings
+   sqlite3 .swarm/memory.db "SELECT claim, confidence FROM findings WHERE claim LIKE '%auth%'"
+
+   # Check architectural constraints
+   sqlite3 .swarm/memory.db "SELECT decision, constraints FROM decisions WHERE decision LIKE '%auth%'"
+
+3. PERFORM REVIEW
+   - Read submitted code files
+   - Run tests: npm test
+   - Check against acceptance criteria
+   - Verify research claims if applicable
+   - Run security checks if code handles sensitive data
+
+4. DOCUMENT FINDINGS
+   For each issue:
+   - Note severity (high/medium/low)
+   - Specify location (file:line or section)
+   - Describe problem clearly
+   - Provide actionable suggestion
+
+5. SUBMIT REVIEW (same threadId)
+   Verdict:
+   - APPROVED: Quality acceptable, minor suggestions optional
+   - NEEDS_REVISION: Specific fixes required, list all issues
+   - REJECTED: Fundamental problems, needs redesign
+
+6. IF NEEDS_REVISION
+   → Wait for developer revision (check inbox)
+   → Re-review with focus on fixed issues
+   → Verify no regressions introduced
+   → Submit follow-up review
+
+7. COMPLETION
+   When all items reviewed, send status: complete
+```
