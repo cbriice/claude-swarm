@@ -70,11 +70,34 @@ export function getDb(): Database {
 
 /**
  * Close the database connection and reset the singleton.
+ * Performs a WAL checkpoint before closing.
  */
 export function closeDb(): void {
   if (dbInstance) {
+    // Checkpoint WAL before closing to ensure durability
+    try {
+      dbInstance.run('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch (error) {
+      console.warn('[db] Failed to checkpoint WAL on close:', error);
+    }
     dbInstance.close();
     dbInstance = null;
+  }
+}
+
+/**
+ * Perform a WAL checkpoint to reduce WAL file size.
+ * Call periodically during long-running operations.
+ * Returns true if checkpoint was successful.
+ */
+export function checkpointWal(): boolean {
+  try {
+    const db = getDb();
+    db.run('PRAGMA wal_checkpoint(TRUNCATE)');
+    return true;
+  } catch (error) {
+    console.warn('[db] Failed to checkpoint WAL:', error);
+    return false;
   }
 }
 
@@ -396,15 +419,95 @@ export interface SessionStats {
 }
 
 // =============================================================================
+// Safe JSON Parsing Helper
+// =============================================================================
+
+/**
+ * Safely parse JSON with a fallback value.
+ * Returns the fallback if parsing fails instead of throwing.
+ */
+function safeJsonParse<T>(json: string | null | undefined, fallback: T): T {
+  if (json === null || json === undefined) {
+    return fallback;
+  }
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    console.warn(`[db] Failed to parse JSON, using fallback:`, json.substring(0, 100));
+    return fallback;
+  }
+}
+
+// =============================================================================
+// Enum Validation Helpers
+// =============================================================================
+
+const VALID_WORKFLOW_TYPES = ['research', 'development', 'architecture'] as const;
+const VALID_SESSION_STATUSES = ['initializing', 'running', 'paused', 'complete', 'failed'] as const;
+const VALID_CONFIDENCES = ['high', 'medium', 'low'] as const;
+const VALID_ARTIFACT_TYPES = ['code', 'test', 'documentation', 'diagram', 'config'] as const;
+const VALID_REVIEW_STATUSES = ['pending', 'approved', 'needs_revision', 'rejected'] as const;
+const VALID_TASK_STATUSES = ['created', 'assigned', 'in_progress', 'review', 'revision', 'complete', 'failed'] as const;
+const VALID_PRIORITIES = ['critical', 'high', 'normal', 'low'] as const;
+const VALID_MESSAGE_TYPES = ['task', 'result', 'question', 'feedback', 'status', 'finding', 'artifact', 'review', 'design'] as const;
+
+/**
+ * Validate and cast a string to an enum type with a fallback.
+ * Logs a warning if the value is invalid.
+ */
+function validateEnum<T extends string>(
+  value: string,
+  validValues: readonly T[],
+  fallback: T,
+  context: string
+): T {
+  if (validValues.includes(value as T)) {
+    return value as T;
+  }
+  console.warn(`[db] Invalid ${context} value "${value}", using fallback "${fallback}"`);
+  return fallback;
+}
+
+// =============================================================================
+// Input Validation Helpers
+// =============================================================================
+
+/**
+ * Validate that a string field is non-empty.
+ * Throws if the value is empty or only whitespace.
+ */
+function requireNonEmpty(value: string, fieldName: string): void {
+  if (!value || value.trim().length === 0) {
+    throw new Error(`${fieldName} is required and cannot be empty`);
+  }
+}
+
+/**
+ * Validate that a value is one of the allowed enum values.
+ * Throws if the value is not valid.
+ */
+function requireValidEnum<T extends string>(
+  value: string,
+  validValues: readonly T[],
+  fieldName: string
+): void {
+  if (!validValues.includes(value as T)) {
+    throw new Error(
+      `Invalid ${fieldName}: "${value}". Must be one of: ${validValues.join(', ')}`
+    );
+  }
+}
+
+// =============================================================================
 // Type Mapping Functions (Row -> Domain types)
 // =============================================================================
 
 export function sessionRowToSwarmSession(row: SessionRow): SwarmSession {
   return {
     id: row.id,
-    workflowType: row.workflow_type as WorkflowType,
+    workflowType: validateEnum(row.workflow_type, VALID_WORKFLOW_TYPES, 'development', 'WorkflowType'),
     goal: row.goal,
-    status: row.status as SessionStatus,
+    status: validateEnum(row.status, VALID_SESSION_STATUSES, 'failed', 'SessionStatus'),
     agents: new Map(), // Agents are runtime-only, not persisted
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -418,8 +521,8 @@ export function findingRowToFinding(row: FindingRow): Finding {
     sessionId: row.session_id,
     agent: row.agent,
     claim: row.claim,
-    confidence: row.confidence as Confidence,
-    sources: JSON.parse(row.sources) as string[],
+    confidence: validateEnum(row.confidence, VALID_CONFIDENCES, 'low', 'Confidence'),
+    sources: safeJsonParse<string[]>(row.sources, []),
     contradictingEvidence: row.contradicting_evidence ?? undefined,
     verifiedBy: row.verified_by ?? undefined,
     verifiedAt: row.verified_at ?? undefined,
@@ -432,12 +535,12 @@ export function artifactRowToArtifact(row: ArtifactRow): Artifact {
     id: row.id,
     sessionId: row.session_id,
     agent: row.agent,
-    artifactType: row.artifact_type as ArtifactType,
+    artifactType: validateEnum(row.artifact_type, VALID_ARTIFACT_TYPES, 'code', 'ArtifactType'),
     filepath: row.filepath,
     content: row.content ?? undefined,
     summary: row.summary ?? undefined,
     version: row.version,
-    reviewStatus: row.review_status as ReviewStatus,
+    reviewStatus: validateEnum(row.review_status, VALID_REVIEW_STATUSES, 'pending', 'ReviewStatus'),
     createdAt: row.created_at,
   };
 }
@@ -449,36 +552,39 @@ export function decisionRowToDecision(row: DecisionRow): Decision {
     agent: row.agent,
     decision: row.decision,
     rationale: row.rationale,
-    alternativesConsidered: JSON.parse(row.alternatives_considered) as Alternative[],
+    alternativesConsidered: safeJsonParse<Alternative[]>(row.alternatives_considered, []),
     createdAt: row.created_at,
   };
 }
 
 export function taskRowToTask(row: TaskRow): Task {
+  // AgentRole validation (same values used for assignedTo)
+  const validAgentRoles = ['orchestrator', 'researcher', 'developer', 'reviewer', 'architect'] as const;
+
   return {
     id: row.id,
     sessionId: row.session_id,
     parentTaskId: row.parent_task_id ?? undefined,
-    assignedTo: row.assigned_to as Task['assignedTo'],
-    status: row.status as TaskStatus,
-    priority: row.priority as Priority,
+    assignedTo: validateEnum(row.assigned_to, validAgentRoles, 'developer', 'AgentRole') as Task['assignedTo'],
+    status: validateEnum(row.status, VALID_TASK_STATUSES, 'failed', 'TaskStatus'),
+    priority: validateEnum(row.priority, VALID_PRIORITIES, 'normal', 'Priority'),
     description: row.description,
-    inputData: row.input_data ? (JSON.parse(row.input_data) as Record<string, unknown>) : undefined,
-    outputData: row.output_data ? (JSON.parse(row.output_data) as Record<string, unknown>) : undefined,
+    inputData: row.input_data ? safeJsonParse<Record<string, unknown>>(row.input_data, {}) : undefined,
+    outputData: row.output_data ? safeJsonParse<Record<string, unknown>>(row.output_data, {}) : undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
 export function messageRowToAgentMessage(row: MessageRow): AgentMessage {
-  const content = JSON.parse(row.content) as MessageContent;
+  const content = safeJsonParse<MessageContent>(row.content, { subject: '', body: '' });
   return {
     id: row.id,
     timestamp: row.created_at,
     from: row.from_agent,
     to: row.to_agent,
-    type: row.message_type as MessageType,
-    priority: row.priority as Priority,
+    type: validateEnum(row.message_type, VALID_MESSAGE_TYPES, 'status', 'MessageType'),
+    priority: validateEnum(row.priority, VALID_PRIORITIES, 'normal', 'Priority'),
     content,
     threadId: row.thread_id ?? undefined,
     requiresResponse: false, // Default, not stored in DB
@@ -490,6 +596,10 @@ export function messageRowToAgentMessage(row: MessageRow): AgentMessage {
 // =============================================================================
 
 export function createSession(input: CreateSessionInput): SwarmSession {
+  // Validate required fields
+  requireNonEmpty(input.goal, 'goal');
+  requireValidEnum(input.workflowType, VALID_WORKFLOW_TYPES, 'workflowType');
+
   const db = getDb();
   const id = generateId();
   const timestamp = now();
@@ -520,16 +630,21 @@ export function getSession(id: string): SwarmSession | null {
   return row ? sessionRowToSwarmSession(row) : null;
 }
 
-export function updateSessionStatus(id: string, status: SessionStatus): void {
+/**
+ * Update session status. Returns true if a row was updated, false if session not found.
+ */
+export function updateSessionStatus(id: string, status: SessionStatus): boolean {
   const db = getDb();
   const timestamp = now();
   const completedAt = status === 'complete' || status === 'failed' ? timestamp : null;
 
-  db.run(
+  const result = db.run(
     `UPDATE sessions SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at)
      WHERE id = ?`,
     [status, timestamp, completedAt, id]
   );
+
+  return result.changes > 0;
 }
 
 export function listSessions(status?: SessionStatus): SwarmSession[] {
@@ -554,6 +669,12 @@ export function listSessions(status?: SessionStatus): SwarmSession[] {
 // =============================================================================
 
 export function createFinding(input: CreateFindingInput): Finding {
+  // Validate required fields
+  requireNonEmpty(input.sessionId, 'sessionId');
+  requireNonEmpty(input.agent, 'agent');
+  requireNonEmpty(input.claim, 'claim');
+  requireValidEnum(input.confidence, VALID_CONFIDENCES, 'confidence');
+
   const db = getDb();
   const id = generateId();
   const timestamp = now();
@@ -612,14 +733,19 @@ export function getUnverifiedFindings(sessionId: string): Finding[] {
   return rows.map(findingRowToFinding);
 }
 
-export function verifyFinding(id: string, verifiedBy: string): void {
+/**
+ * Mark a finding as verified. Returns true if updated, false if finding not found.
+ */
+export function verifyFinding(id: string, verifiedBy: string): boolean {
   const db = getDb();
   const timestamp = now();
 
-  db.run(
+  const result = db.run(
     'UPDATE findings SET verified_by = ?, verified_at = ? WHERE id = ?',
     [verifiedBy, timestamp, id]
   );
+
+  return result.changes > 0;
 }
 
 // =============================================================================
@@ -627,6 +753,12 @@ export function verifyFinding(id: string, verifiedBy: string): void {
 // =============================================================================
 
 export function createArtifact(input: CreateArtifactInput): Artifact {
+  // Validate required fields
+  requireNonEmpty(input.sessionId, 'sessionId');
+  requireNonEmpty(input.agent, 'agent');
+  requireNonEmpty(input.filepath, 'filepath');
+  requireValidEnum(input.artifactType, VALID_ARTIFACT_TYPES, 'artifactType');
+
   const db = getDb();
   const id = generateId();
   const timestamp = now();
@@ -689,19 +821,28 @@ export function getArtifactsByStatus(sessionId: string, status: ReviewStatus): A
   return rows.map(artifactRowToArtifact);
 }
 
-export function updateArtifactReviewStatus(id: string, status: ReviewStatus): void {
+/**
+ * Update artifact review status. Returns true if updated, false if artifact not found.
+ */
+export function updateArtifactReviewStatus(id: string, status: ReviewStatus): boolean {
   const db = getDb();
-  db.run('UPDATE artifacts SET review_status = ? WHERE id = ?', [status, id]);
+  const result = db.run('UPDATE artifacts SET review_status = ? WHERE id = ?', [status, id]);
+  return result.changes > 0;
 }
 
-export function updateArtifactContent(id: string, content: string, summary?: string): void {
+/**
+ * Update artifact content and increment version. Returns true if updated, false if artifact not found.
+ */
+export function updateArtifactContent(id: string, content: string, summary?: string): boolean {
   const db = getDb();
 
   // Increment version
-  db.run(
+  const result = db.run(
     `UPDATE artifacts SET content = ?, summary = COALESCE(?, summary), version = version + 1 WHERE id = ?`,
     [content, summary ?? null, id]
   );
+
+  return result.changes > 0;
 }
 
 // =============================================================================
@@ -709,6 +850,12 @@ export function updateArtifactContent(id: string, content: string, summary?: str
 // =============================================================================
 
 export function createDecision(input: CreateDecisionInput): Decision {
+  // Validate required fields
+  requireNonEmpty(input.sessionId, 'sessionId');
+  requireNonEmpty(input.agent, 'agent');
+  requireNonEmpty(input.decision, 'decision');
+  requireNonEmpty(input.rationale, 'rationale');
+
   const db = getDb();
   const id = generateId();
   const timestamp = now();
@@ -761,6 +908,12 @@ export function getSessionDecisions(sessionId: string): Decision[] {
 // =============================================================================
 
 export function createTask(input: CreateTaskInput): Task {
+  // Validate required fields
+  requireNonEmpty(input.sessionId, 'sessionId');
+  requireNonEmpty(input.assignedTo, 'assignedTo');
+  requireNonEmpty(input.description, 'description');
+  requireValidEnum(input.priority, VALID_PRIORITIES, 'priority');
+
   const db = getDb();
   const id = generateId();
   const timestamp = now();
@@ -832,14 +985,19 @@ export function getAgentTasks(sessionId: string, agent: string): Task[] {
   return rows.map(taskRowToTask);
 }
 
-export function updateTaskStatus(id: string, status: TaskStatus, outputData?: Record<string, unknown>): void {
+/**
+ * Update task status and optionally output data. Returns true if updated, false if task not found.
+ */
+export function updateTaskStatus(id: string, status: TaskStatus, outputData?: Record<string, unknown>): boolean {
   const db = getDb();
   const timestamp = now();
 
-  db.run(
+  const result = db.run(
     `UPDATE tasks SET status = ?, output_data = COALESCE(?, output_data), updated_at = ? WHERE id = ?`,
     [status, outputData ? JSON.stringify(outputData) : null, timestamp, id]
   );
+
+  return result.changes > 0;
 }
 
 // =============================================================================
@@ -847,6 +1005,13 @@ export function updateTaskStatus(id: string, status: TaskStatus, outputData?: Re
 // =============================================================================
 
 export function createMessage(input: CreateMessageInput): AgentMessage {
+  // Validate required fields
+  requireNonEmpty(input.sessionId, 'sessionId');
+  requireNonEmpty(input.from, 'from');
+  requireNonEmpty(input.to, 'to');
+  requireValidEnum(input.messageType, VALID_MESSAGE_TYPES, 'messageType');
+  requireValidEnum(input.priority, VALID_PRIORITIES, 'priority');
+
   const db = getDb();
   const id = generateId();
   const timestamp = now();

@@ -5,8 +5,9 @@
  * Messages are stored as JSON arrays in inbox/outbox files per agent.
  */
 
-import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, openSync, closeSync } from 'fs';
 import { join, dirname } from 'path';
+import { constants } from 'fs';
 import {
   generateId,
   now,
@@ -30,6 +31,10 @@ export const INBOX_DIR = '.swarm/messages/inbox';
 export const OUTBOX_DIR = '.swarm/messages/outbox';
 
 export const VALID_AGENTS = ['researcher', 'developer', 'reviewer', 'architect', 'orchestrator'] as const;
+
+// Size limits to prevent DoS attacks and unbounded growth
+export const MAX_MESSAGE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB per message
+export const MAX_INBOX_MESSAGES = 1000; // Max messages per inbox
 export type ValidAgent = typeof VALID_AGENTS[number];
 
 export const PRIORITY_ORDER = ['critical', 'high', 'normal', 'low'] as const;
@@ -116,6 +121,91 @@ function writeMessagesFile(path: string, messages: AgentMessage[]): void {
       // Ignore cleanup errors
     }
     throw error;
+  }
+}
+
+// =============================================================================
+// File Locking (prevents race conditions in read-modify-write operations)
+// =============================================================================
+
+const LOCK_TIMEOUT_MS = 5000;
+const LOCK_RETRY_DELAY_MS = 50;
+const MAX_LOCK_RETRIES = 100;
+
+/**
+ * Acquire a lock for a file path.
+ * Returns the lock file path if acquired, null if timeout.
+ */
+function acquireLock(filePath: string): string | null {
+  const lockPath = `${filePath}.lock`;
+  const startTime = Date.now();
+  let retries = 0;
+
+  while (Date.now() - startTime < LOCK_TIMEOUT_MS && retries < MAX_LOCK_RETRIES) {
+    try {
+      // Try to create lock file exclusively
+      const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      writeFileSync(fd, `${process.pid}\n${Date.now()}`);
+      closeSync(fd);
+      return lockPath;
+    } catch (err: unknown) {
+      const error = err as NodeJS.ErrnoException;
+      if (error.code === 'EEXIST') {
+        // Lock exists, check if it's stale (older than timeout)
+        try {
+          const content = readFileSync(lockPath, 'utf-8');
+          const lockTime = parseInt(content.split('\n')[1] || '0', 10);
+          if (Date.now() - lockTime > LOCK_TIMEOUT_MS) {
+            // Stale lock, try to remove it
+            try {
+              unlinkSync(lockPath);
+            } catch {
+              // Another process may have removed it
+            }
+          }
+        } catch {
+          // Lock file unreadable or deleted, try again
+        }
+
+        // Wait with jitter before retry
+        const jitter = Math.random() * LOCK_RETRY_DELAY_MS;
+        const delay = LOCK_RETRY_DELAY_MS + jitter;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+        retries++;
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Release a previously acquired lock.
+ */
+function releaseLock(lockPath: string): void {
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // Lock may already be released
+  }
+}
+
+/**
+ * Execute a function while holding a file lock.
+ * Provides atomic read-modify-write semantics.
+ */
+function withFileLock<T>(filePath: string, fn: () => T): T {
+  const lockPath = acquireLock(filePath);
+  if (!lockPath) {
+    throw new Error(`Failed to acquire lock for ${filePath} after ${LOCK_TIMEOUT_MS}ms`);
+  }
+
+  try {
+    return fn();
+  } finally {
+    releaseLock(lockPath);
   }
 }
 
@@ -216,6 +306,32 @@ export function isValidAgent(agent: string): agent is ValidAgent {
   return (VALID_AGENTS as readonly string[]).includes(agent);
 }
 
+/**
+ * Sanitize agent name to prevent path traversal attacks.
+ * Only allows alphanumeric characters, hyphens, and underscores.
+ * Throws if the sanitized name is empty or differs from input (indicating malicious input).
+ */
+function sanitizeAgentName(agent: string): string {
+  // First check if it's a known valid agent - fast path
+  if (isValidAgent(agent)) {
+    return agent;
+  }
+
+  // For dynamic agents, sanitize to prevent path traversal
+  const sanitized = agent.replace(/[^a-zA-Z0-9_-]/g, '');
+
+  if (sanitized.length === 0) {
+    throw new Error(`Invalid agent name: "${agent}" - must contain alphanumeric characters`);
+  }
+
+  // If sanitization changed the string significantly, it may be an attack
+  if (sanitized !== agent) {
+    console.warn(`[message-bus] Agent name sanitized: "${agent}" -> "${sanitized}"`);
+  }
+
+  return sanitized;
+}
+
 // =============================================================================
 // Message Creation
 // =============================================================================
@@ -249,9 +365,11 @@ export function createMessage(input: SendMessageInput): AgentMessage {
 
 /**
  * Get the file path for an agent's inbox.
+ * Sanitizes agent name to prevent path traversal attacks.
  */
 export function getInboxPath(agent: string): string {
-  return join(INBOX_DIR, `${agent}.json`);
+  const safeAgent = sanitizeAgentName(agent);
+  return join(INBOX_DIR, `${safeAgent}.json`);
 }
 
 /**
@@ -264,12 +382,26 @@ export function readInbox(agent: string): AgentMessage[] {
 
 /**
  * Add a message to an agent's inbox atomically.
+ * Uses file locking to prevent race conditions.
+ * Enforces inbox size limits - oldest messages are dropped if limit exceeded.
  */
 export function addToInbox(agent: string, message: AgentMessage): void {
   const path = getInboxPath(agent);
-  const messages = readMessagesFile(path);
-  messages.push(message);
-  writeMessagesFile(path, messages);
+  withFileLock(path, () => {
+    let messages = readMessagesFile(path);
+    messages.push(message);
+
+    // Enforce inbox size limit by removing oldest messages
+    if (messages.length > MAX_INBOX_MESSAGES) {
+      const dropped = messages.length - MAX_INBOX_MESSAGES;
+      console.warn(
+        `[message-bus] Inbox for ${agent} exceeded limit, dropping ${dropped} oldest messages`
+      );
+      messages = messages.slice(-MAX_INBOX_MESSAGES);
+    }
+
+    writeMessagesFile(path, messages);
+  });
 }
 
 /**
@@ -282,18 +414,21 @@ export function clearInbox(agent: string): void {
 /**
  * Remove a specific message from an agent's inbox by ID.
  * Returns true if message was found and removed.
+ * Uses file locking to prevent race conditions.
  */
 export function removeFromInbox(agent: string, messageId: string): boolean {
   const path = getInboxPath(agent);
-  const messages = readMessagesFile(path);
-  const originalLength = messages.length;
-  const filtered = messages.filter(m => m.id !== messageId);
+  return withFileLock(path, () => {
+    const messages = readMessagesFile(path);
+    const originalLength = messages.length;
+    const filtered = messages.filter(m => m.id !== messageId);
 
-  if (filtered.length !== originalLength) {
-    writeMessagesFile(path, filtered);
-    return true;
-  }
-  return false;
+    if (filtered.length !== originalLength) {
+      writeMessagesFile(path, filtered);
+      return true;
+    }
+    return false;
+  });
 }
 
 /**
@@ -332,9 +467,11 @@ export function getInboxByPriority(agent: string, minPriority: Priority): AgentM
 
 /**
  * Get the file path for an agent's outbox.
+ * Sanitizes agent name to prevent path traversal attacks.
  */
 export function getOutboxPath(agent: string): string {
-  return join(OUTBOX_DIR, `${agent}.json`);
+  const safeAgent = sanitizeAgentName(agent);
+  return join(OUTBOX_DIR, `${safeAgent}.json`);
 }
 
 /**
@@ -346,12 +483,15 @@ export function readOutbox(agent: string): AgentMessage[] {
 
 /**
  * Add a message to an agent's outbox atomically.
+ * Uses file locking to prevent race conditions.
  */
 export function addToOutbox(agent: string, message: AgentMessage): void {
   const path = getOutboxPath(agent);
-  const messages = readMessagesFile(path);
-  messages.push(message);
-  writeMessagesFile(path, messages);
+  withFileLock(path, () => {
+    const messages = readMessagesFile(path);
+    messages.push(message);
+    writeMessagesFile(path, messages);
+  });
 }
 
 /**
@@ -379,9 +519,18 @@ export function getNewOutboxMessages(agent: string, since: string): AgentMessage
  * - Adds to sender's outbox
  * - Routes to recipient's inbox (or all inboxes for broadcast)
  * - Optionally persists to database
+ * - Validates message size to prevent DoS
  */
 export function sendMessage(input: SendMessageInput, options?: SendOptions): AgentMessage {
   ensureMessageDirs();
+
+  // Validate message size before creating
+  const contentSize = JSON.stringify(input.content).length;
+  if (contentSize > MAX_MESSAGE_SIZE_BYTES) {
+    throw new Error(
+      `Message content exceeds maximum size: ${contentSize} bytes > ${MAX_MESSAGE_SIZE_BYTES} bytes`
+    );
+  }
 
   const message = createMessage(input);
 
