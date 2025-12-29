@@ -36,3 +36,7 @@ Thumbs.db
 
 # TypeScript build info
 *.tsbuildinfo
+
+docs/plans/
+docs/testing/
+docs/code_reviews/
