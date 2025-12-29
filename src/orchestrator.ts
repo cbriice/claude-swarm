@@ -782,6 +782,14 @@ export class Orchestrator {
 
     if (!startResult.ok) {
       agent.status = 'error';
+      // Clean up the orphaned pane
+      try {
+        await tmux.killPane(sessionName, paneId);
+      } catch {
+        // Ignore cleanup errors
+      }
+      this.session.agents.delete(role);
+      this.outboxStates.delete(role);
       return err(
         createOrchestratorError('AGENT_SPAWN_FAILED', `Failed to start Claude Code: ${startResult.error.message}`)
       );
@@ -791,6 +799,14 @@ export class Orchestrator {
     const readyResult = await this.waitForAgentReady(role);
     if (!readyResult.ok) {
       agent.status = 'error';
+      // Clean up the orphaned pane
+      try {
+        await tmux.killPane(sessionName, paneId);
+      } catch {
+        // Ignore cleanup errors
+      }
+      this.session.agents.delete(role);
+      this.outboxStates.delete(role);
       return err(readyResult.error);
     }
 
@@ -1060,6 +1076,12 @@ export class Orchestrator {
   }
 
   /**
+   * Maximum recovery attempts per agent to prevent infinite recovery loops.
+   */
+  private static readonly MAX_RECOVERY_PER_AGENT = 3;
+  private static readonly MAX_TOTAL_RECOVERY = 10;
+
+  /**
    * Check agent health and execute recovery if needed.
    */
   async checkAgentHealth(role: AgentRole): Promise<AgentStatus> {
@@ -1082,6 +1104,44 @@ export class Orchestrator {
     const lastActivity = new Date(agent.lastActivityAt).getTime();
     if (Date.now() - lastActivity > this._config.agentTimeout) {
       agent.status = 'error';
+
+      // Check global recovery limits to prevent infinite loops
+      if (this.totalRecoveryAttempts >= Orchestrator.MAX_TOTAL_RECOVERY) {
+        if (this._config.verboseLogging) {
+          console.warn(`[orchestrator] Maximum total recovery attempts (${Orchestrator.MAX_TOTAL_RECOVERY}) reached, skipping recovery for ${role}`);
+        }
+        this.recordError({
+          timestamp: now(),
+          agent: role,
+          type: 'timeout',
+          message: `Agent ${role} timed out - recovery limit exceeded`,
+          recoverable: false,
+          recovered: false,
+        });
+        return agent.status;
+      }
+
+      // Check per-agent recovery limit
+      const agentRecoveryKey = `recovery:${role}`;
+      const agentRecoveryAttempts = this.attemptHistory.get(agentRecoveryKey) ?? 0;
+      if (agentRecoveryAttempts >= Orchestrator.MAX_RECOVERY_PER_AGENT) {
+        if (this._config.verboseLogging) {
+          console.warn(`[orchestrator] Maximum recovery attempts for agent ${role} reached, skipping recovery`);
+        }
+        this.recordError({
+          timestamp: now(),
+          agent: role,
+          type: 'timeout',
+          message: `Agent ${role} timed out - agent recovery limit exceeded`,
+          recoverable: false,
+          recovered: false,
+        });
+        return agent.status;
+      }
+
+      // Update recovery attempt counters
+      this.attemptHistory.set(agentRecoveryKey, agentRecoveryAttempts + 1);
+      this.totalRecoveryAttempts++;
 
       // Create a SwarmError for proper error handling integration
       const swarmError = createSwarmError('AGENT_TIMEOUT', {
@@ -1351,6 +1411,17 @@ export class Orchestrator {
     if (this.session.result) {
       this.emit({ type: 'session_ended', result: this.session.result });
     }
+
+    // Clear event handlers to prevent memory leaks
+    this.eventHandlers.clear();
+
+    // Reset internal state
+    this.outboxStates.clear();
+    this.sessionErrors = [];
+    this.recoveryAttempts = [];
+    this.swarmErrors = [];
+    this.attemptHistory.clear();
+    this.totalRecoveryAttempts = 0;
 
     if (this._config.verboseLogging) {
       if (cleanupErrors.length > 0) {
