@@ -5,7 +5,7 @@
  * and Claude Code instances. Uses Bun's shell execution for all tmux commands.
  */
 
-import { Result, ok, err } from './types';
+import { Result, ok, err } from '../types.js';
 
 // =============================================================================
 // Type Definitions

@@ -83,8 +83,8 @@ export interface AgentInfo {
   lastActivity?: string;
 }
 
-/** The four defined agent roles */
-export type AgentRole = 'researcher' | 'developer' | 'reviewer' | 'architect';
+/** The five defined agent roles */
+export type AgentRole = 'orchestrator' | 'researcher' | 'developer' | 'reviewer' | 'architect';
 
 /** Agent lifecycle states */
 export type AgentStatus =
