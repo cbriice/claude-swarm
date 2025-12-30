@@ -791,9 +791,10 @@ export class Orchestrator {
       lastMessageCount: 0,
     });
 
-    // Start Claude Code in the pane (don't use resume - agents start fresh each session)
+    // Start Claude Code in the pane (autonomous mode - no permission prompts)
     const startResult = await tmux.startClaudeCode(sessionName, paneId, {
       workdir: worktreePath,
+      skipPermissions: true,  // Agents run autonomously without human approval
     });
 
     if (!startResult.ok) {

@@ -101,7 +101,31 @@ export interface ClaudeCodeOptions {
   resume?: boolean;
   workdir?: string;
   initialPrompt?: string;
+  skipPermissions?: boolean;  // Use --dangerously-skip-permissions for autonomous operation
+  disallowedTools?: string[]; // Tools to block (e.g., "Bash(rm -rf:*)")
 }
+
+// Default dangerous patterns to block even in autonomous mode
+export const DANGEROUS_TOOL_PATTERNS = [
+  'Bash(rm -rf:*)',
+  'Bash(rm -r /:*)',
+  'Bash(rm -rf /:*)',
+  'Bash(rm -rf ~:*)',
+  'Bash(rm -rf /*:*)',
+  'Bash(sudo rm:*)',
+  'Bash(chmod -R 777 /:*)',
+  'Bash(mkfs:*)',
+  'Bash(dd if=:*)',
+  'Bash(:(){ :|:& };:)',  // Fork bomb
+  'Bash(> /dev/sda:*)',
+  'Bash(mv /* :*)',
+  'Bash(wget * | sh:*)',
+  'Bash(curl * | sh:*)',
+  'Bash(shutdown:*)',
+  'Bash(reboot:*)',
+  'Bash(init 0:*)',
+  'Bash(halt:*)',
+];
 
 export interface ResizeOptions {
   width?: number;
@@ -880,6 +904,19 @@ export async function startClaudeCode(
 
   // Build claude command
   let command = 'claude';
+
+  // Skip permissions for autonomous agent operation
+  if (options?.skipPermissions) {
+    command += ' --dangerously-skip-permissions';
+
+    // Always block dangerous patterns when running autonomously
+    const disallowed = [...DANGEROUS_TOOL_PATTERNS, ...(options.disallowedTools || [])];
+    if (disallowed.length > 0) {
+      // Quote each pattern to handle special characters
+      const quotedPatterns = disallowed.map(p => `"${p.replace(/"/g, '\\"')}"`).join(' ');
+      command += ` --disallowedTools ${quotedPatterns}`;
+    }
+  }
 
   if (options?.resume) {
     command += ' --resume';
