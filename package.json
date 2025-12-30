@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "bun swarm.ts",
-    "dev": "bun --watch swarm.ts",
+    "start": "bun src/swarm.ts",
+    "dev": "bun --watch src/swarm.ts",
     "test": "bun test",
     "typecheck": "bun run tsc --noEmit"
   },
