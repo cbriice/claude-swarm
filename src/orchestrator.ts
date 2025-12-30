@@ -544,6 +544,19 @@ export class Orchestrator {
         { persistToDb: true, sessionId }
       );
 
+      // Kick the entry agent to start working
+      const entryAgent = this.session.agents.get(taskMessage.to as AgentRole);
+      if (entryAgent) {
+        const kickResult = await tmux.sendToClaudeCode(
+          `swarm_${sessionId}`,
+          entryAgent.paneId,
+          `You have a new task in your inbox. Read it with: cat .swarm/messages/inbox/${taskMessage.to}.json\n\nThen begin working on the task. Write your output to your outbox.`
+        );
+        if (!kickResult.ok) {
+          this.logger.orchestrator.warn('agent_kick_failed', { agent: taskMessage.to, error: kickResult.error.message }, `Failed to kick agent ${taskMessage.to}: ${kickResult.error.message}`);
+        }
+      }
+
       // Update session status
       this.session.status = 'running';
       db.updateSessionStatus(sessionId, 'running');
@@ -1660,6 +1673,17 @@ export class Orchestrator {
       },
       { persistToDb: true, sessionId: this.session.id }
     );
+
+    // Kick the target agent to check their inbox
+    const sessionName = `swarm_${this.session.id}`;
+    const kickResult = await tmux.sendToClaudeCode(
+      sessionName,
+      targetAgent.paneId,
+      `You have a new ${decision.message.type} message in your inbox from ${from}. Read it with: cat .swarm/messages/inbox/${decision.to}.json\n\nProcess it and write your response to your outbox.`
+    );
+    if (!kickResult.ok) {
+      this.logger.orchestrator.warn('agent_kick_failed', { agent: decision.to, error: kickResult.error.message }, `Failed to kick agent ${decision.to}: ${kickResult.error.message}`);
+    }
 
     this.emit({
       type: 'message_routed',

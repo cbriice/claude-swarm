@@ -497,7 +497,7 @@ export async function createPane(
 
   // Set pane title if provided
   if (options?.name) {
-    await runTmux(['select-pane', '-t', `${sessionName}:${paneId}`, '-T', options.name]);
+    await runTmux(['select-pane', '-t', paneId, '-T', options.name]);
   }
 
   moduleLogger.subprocess.info('pane_created', { session: sessionName, pane: paneId, name: options?.name }, `Created pane ${paneId}${options?.name ? ` (${options.name})` : ''} in session ${sessionName}`);
