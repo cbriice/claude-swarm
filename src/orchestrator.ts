@@ -95,7 +95,7 @@ export interface OrchestratorConfig {
  */
 const DEFAULT_CONFIG: Required<Omit<OrchestratorConfig, 'logger'>> = {
   sessionId: '',
-  monitorInterval: 5000,
+  monitorInterval: 2000,
   agentTimeout: 300000,    // 5 minutes
   workflowTimeout: 1800000, // 30 minutes
   autoCleanup: true,
@@ -231,12 +231,7 @@ export type OrchestratorErrorCode =
 // Constants
 // =============================================================================
 
-const READY_INDICATORS = [
-  '> ',           // Claude Code prompt
-  'Claude Code',  // Startup banner
-  'What would',   // "What would you like to do?"
-  'Human:',       // Alternative prompt style
-];
+// Ready detection moved to detectAgentReady() function for more precise matching
 
 const SWARM_DIR = '.swarm';
 const OUTPUTS_DIR = 'outputs';
@@ -269,10 +264,55 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Retry a kick operation with exponential backoff.
+ * Returns true if the kick eventually succeeded.
+ */
+async function retryKick(
+  kickFn: () => Promise<{ ok: boolean; error?: { message: string } }>,
+  maxRetries: number = 3,
+  baseDelayMs: number = 500
+): Promise<{ success: boolean; attempts: number; lastError?: string }> {
+  let lastError: string | undefined;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const result = await kickFn();
+    if (result.ok) {
+      return { success: true, attempts: attempt };
+    }
+
+    lastError = result.error?.message ?? 'Unknown error';
+
+    if (attempt < maxRetries) {
+      // Exponential backoff: 500ms, 1000ms, 2000ms...
+      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      await sleep(delay);
+    }
+  }
+
+  return { success: false, attempts: maxRetries, lastError };
+}
+
+/**
  * Check if Claude Code appears to be ready based on output.
+ * Looks for the Claude Code prompt '> ' at the start of a line.
  */
 function detectAgentReady(output: string): boolean {
-  return READY_INDICATORS.some((indicator) => output.includes(indicator));
+  // Look for '> ' at the start of a line (the actual Claude Code input prompt)
+  // This is more precise than just checking if '>' exists anywhere
+  const lines = output.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Claude Code prompt starts with '>' followed by space (regular or non-breaking)
+    // Note: Claude Code uses non-breaking space (\u00A0) in its prompt, not regular space
+    if (trimmed.startsWith('>\u00A0') || trimmed.startsWith('> ') || trimmed === '>') {
+      return true;
+    }
+    // Also check for other indicators
+    if (trimmed.includes('What would') || trimmed.includes('Human:')) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // =============================================================================
@@ -292,6 +332,11 @@ export class Orchestrator {
   private totalRecoveryAttempts: number = 0;
   private swarmErrors: SwarmError[] = [];
   private logger: Logger;
+  private lastNudgeTimes: Map<AgentRole, number> = new Map();
+  private lastHeartbeatTimes: Map<AgentRole, number> = new Map();
+  private nudgedMessageIds: Map<AgentRole, Set<string>> = new Map(); // Track messages we've already nudged about
+  private static readonly NUDGE_INTERVAL_MS = 10000; // Nudge idle agents every 10 seconds
+  private static readonly HEARTBEAT_INTERVAL_MS = 30000; // Request heartbeat every 30 seconds
 
   // Public readonly properties
   public get sessionId(): string {
@@ -545,16 +590,21 @@ export class Orchestrator {
         { persistToDb: true, sessionId }
       );
 
-      // Kick the entry agent to start working
+      // Kick the entry agent to start working (with retry)
       const entryAgent = this.session.agents.get(taskMessage.to as AgentRole);
       if (entryAgent) {
-        const kickResult = await tmux.sendToClaudeCode(
-          `swarm_${sessionId}`,
-          entryAgent.paneId,
-          `You have a new task in your inbox. Read it with: cat .swarm/messages/inbox/${taskMessage.to}.json\n\nThen begin working on the task. Write your output to your outbox.`
-        );
-        if (!kickResult.ok) {
-          this.logger.orchestrator.warn('agent_kick_failed', { agent: taskMessage.to, error: kickResult.error.message }, `Failed to kick agent ${taskMessage.to}: ${kickResult.error.message}`);
+        const kickRetry = await retryKick(async () => {
+          const result = await tmux.sendToClaudeCode(
+            `swarm_${sessionId}`,
+            entryAgent.paneId,
+            `You have a new task in your inbox. Read it with: cat .swarm/messages/inbox/${taskMessage.to}.json\n\nThen begin working on the task. Write your output to your outbox.`
+          );
+          return { ok: result.ok, error: result.ok ? undefined : { message: result.error.message } };
+        });
+        if (!kickRetry.success) {
+          this.logger.orchestrator.warn('agent_kick_failed', { agent: taskMessage.to, attempts: kickRetry.attempts, error: kickRetry.lastError }, `Failed to kick agent ${taskMessage.to} after ${kickRetry.attempts} attempts: ${kickRetry.lastError}`);
+        } else if (kickRetry.attempts > 1) {
+          this.logger.orchestrator.info('agent_kick_retry_success', { agent: taskMessage.to, attempts: kickRetry.attempts }, `Kicked agent ${taskMessage.to} after ${kickRetry.attempts} attempts`);
         }
       }
 
@@ -1531,6 +1581,9 @@ export class Orchestrator {
       const captureResult = await tmux.capturePane(sessionName, agent.paneId, { lines: 30 });
 
       if (captureResult.ok && detectAgentReady(captureResult.value)) {
+        // Wait for Claude Code to fully initialize after prompt appears
+        // Claude Code needs ~2s after showing prompt before accepting input reliably
+        await sleep(2000);
         return ok(undefined);
       }
 
@@ -1601,12 +1654,134 @@ export class Orchestrator {
       await this.checkAgentHealth(role);
     }
 
+    // Nudge idle agents to check their inboxes
+    await this.nudgeIdleAgents();
+
+    // Send heartbeat checks to agents
+    await this.sendHeartbeatChecks();
+
     // Check outboxes for new messages
     await this.checkOutboxes();
 
     // Check for workflow completion
     if (isWorkflowComplete(this.session.workflowInstance)) {
       await this.handleWorkflowComplete();
+    }
+  }
+
+  /**
+   * Nudge idle agents to check their inboxes.
+   * Sends a reminder every NUDGE_INTERVAL_MS to agents that haven't produced recent output.
+   */
+  private async nudgeIdleAgents(): Promise<void> {
+    if (!this.session) {
+      return;
+    }
+
+    const currentTime = Date.now();
+    const sessionName = `swarm_${this.session.id}`;
+
+    for (const [role, agent] of this.session.agents) {
+      // Skip if not in a healthy running state
+      if (agent.status !== 'ready' && agent.status !== 'idle' && agent.status !== 'working') {
+        continue;
+      }
+
+      // Check if agent has pending messages in inbox
+      const inboxMessages = messageBus.readInbox(role);
+      if (inboxMessages.length === 0) {
+        // Clear tracked message IDs when inbox is empty
+        this.nudgedMessageIds.delete(role);
+        continue;
+      }
+
+      // Get or create the set of message IDs we've already nudged about
+      let nudgedIds = this.nudgedMessageIds.get(role);
+      if (!nudgedIds) {
+        nudgedIds = new Set();
+        this.nudgedMessageIds.set(role, nudgedIds);
+      }
+
+      // Find messages we haven't nudged about yet
+      const newMessageIds = inboxMessages
+        .map(m => m.id)
+        .filter(id => !nudgedIds.has(id));
+
+      if (newMessageIds.length === 0) {
+        continue; // Already nudged about all current messages
+      }
+
+      // Check if enough time has passed since last nudge
+      const lastNudge = this.lastNudgeTimes.get(role) ?? 0;
+      if (currentTime - lastNudge < Orchestrator.NUDGE_INTERVAL_MS) {
+        continue; // Recently nudged, skip
+      }
+
+      // Nudge the agent
+      this.lastNudgeTimes.set(role, currentTime);
+
+      const nudgeResult = await tmux.sendToClaudeCode(
+        sessionName,
+        agent.paneId,
+        `Reminder: You have ${inboxMessages.length} message(s) in your inbox. Read with: cat .swarm/messages/inbox/${role}.json`
+      );
+
+      if (nudgeResult.ok) {
+        // Mark these messages as nudged - won't nudge again for same messages
+        newMessageIds.forEach(id => nudgedIds!.add(id));
+        this.logger.orchestrator.debug('agent_nudged', { agent: role, pendingMessages: inboxMessages.length, newMessages: newMessageIds.length }, `Nudged agent ${role} about ${newMessageIds.length} new message(s)`);
+      } else {
+        this.logger.orchestrator.warn('agent_nudge_failed', { agent: role, error: nudgeResult.error.message }, `Failed to nudge agent ${role}: ${nudgeResult.error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Send heartbeat checks to agents every HEARTBEAT_INTERVAL_MS.
+   * Agents should respond with activity, allowing faster detection of dead agents.
+   */
+  private async sendHeartbeatChecks(): Promise<void> {
+    if (!this.session) {
+      return;
+    }
+
+    const currentTime = Date.now();
+    const sessionName = `swarm_${this.session.id}`;
+
+    for (const [role, agent] of this.session.agents) {
+      // Skip if agent is already in error state
+      if (agent.status === 'error' || agent.status === 'terminated') {
+        continue;
+      }
+
+      // Check if enough time has passed since last heartbeat
+      const lastHeartbeat = this.lastHeartbeatTimes.get(role) ?? 0;
+      if (currentTime - lastHeartbeat < Orchestrator.HEARTBEAT_INTERVAL_MS) {
+        continue;
+      }
+
+      // Don't send heartbeat if agent has recent activity (within heartbeat interval)
+      const lastActivity = new Date(agent.lastActivityAt).getTime();
+      if (currentTime - lastActivity < Orchestrator.HEARTBEAT_INTERVAL_MS) {
+        // Reset heartbeat timer since agent is active
+        this.lastHeartbeatTimes.set(role, currentTime);
+        continue;
+      }
+
+      // Send heartbeat request
+      this.lastHeartbeatTimes.set(role, currentTime);
+
+      const heartbeatResult = await tmux.sendToClaudeCode(
+        sessionName,
+        agent.paneId,
+        `HEARTBEAT CHECK: Please confirm you're active by writing a brief status to your outbox (.swarm/messages/outbox/${role}.json). If you're working on something, continue. If idle, check your inbox.`
+      );
+
+      if (heartbeatResult.ok) {
+        this.logger.orchestrator.debug('heartbeat_sent', { agent: role }, `Sent heartbeat check to ${role}`);
+      } else {
+        this.logger.orchestrator.warn('heartbeat_failed', { agent: role, error: heartbeatResult.error.message }, `Failed to send heartbeat to ${role}: ${heartbeatResult.error.message}`);
+      }
     }
   }
 
@@ -1675,15 +1850,20 @@ export class Orchestrator {
       { persistToDb: true, sessionId: this.session.id }
     );
 
-    // Kick the target agent to check their inbox
+    // Kick the target agent to check their inbox (with retry)
     const sessionName = `swarm_${this.session.id}`;
-    const kickResult = await tmux.sendToClaudeCode(
-      sessionName,
-      targetAgent.paneId,
-      `You have a new ${decision.message.type} message in your inbox from ${from}. Read it with: cat .swarm/messages/inbox/${decision.to}.json\n\nProcess it and write your response to your outbox.`
-    );
-    if (!kickResult.ok) {
-      this.logger.orchestrator.warn('agent_kick_failed', { agent: decision.to, error: kickResult.error.message }, `Failed to kick agent ${decision.to}: ${kickResult.error.message}`);
+    const kickRetry = await retryKick(async () => {
+      const result = await tmux.sendToClaudeCode(
+        sessionName,
+        targetAgent.paneId,
+        `You have a new ${decision.message.type} message in your inbox from ${from}. Read it with: cat .swarm/messages/inbox/${decision.to}.json\n\nProcess it and write your response to your outbox.`
+      );
+      return { ok: result.ok, error: result.ok ? undefined : { message: result.error.message } };
+    });
+    if (!kickRetry.success) {
+      this.logger.orchestrator.warn('agent_kick_failed', { agent: decision.to, attempts: kickRetry.attempts, error: kickRetry.lastError }, `Failed to kick agent ${decision.to} after ${kickRetry.attempts} attempts: ${kickRetry.lastError}`);
+    } else if (kickRetry.attempts > 1) {
+      this.logger.orchestrator.info('agent_kick_retry_success', { agent: decision.to, attempts: kickRetry.attempts }, `Kicked agent ${decision.to} after ${kickRetry.attempts} attempts`);
     }
 
     this.emit({

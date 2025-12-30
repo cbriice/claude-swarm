@@ -533,7 +533,7 @@ export function getNewOutboxMessages(agent: string, since: string): AgentMessage
   // Subtract tolerance to account for clock skew - messages within the tolerance
   // window before 'since' will be included to prevent missing messages
   const adjustedSince = sinceDate.getTime() - CLOCK_SKEW_TOLERANCE_MS;
-  return readOutbox(agent).filter(m => new Date(m.timestamp).getTime() > adjustedSince);
+  return readOutbox(agent).filter(m => new Date(m.timestamp).getTime() >= adjustedSince);
 }
 
 // =============================================================================
