@@ -29,6 +29,25 @@ import {
   getStepById,
 } from './templates.js';
 
+import { type Logger, createNoopLogger, formatDuration } from '../logger.js';
+
+// =============================================================================
+// Module-Level Logger
+// =============================================================================
+
+/**
+ * Module-level logger instance. Set via setLogger() to enable logging.
+ */
+let moduleLogger: Logger = createNoopLogger();
+
+/**
+ * Set the logger for this module.
+ * Called from swarm.ts during initialization.
+ */
+export function setLogger(logger: Logger): void {
+  moduleLogger = logger;
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -169,6 +188,7 @@ export function startStep(
     iterationCounts: new Map(instance.iterationCounts).set(stepId, currentIterations + 1),
   };
 
+  moduleLogger.workflow.info('step_start', { workflow: instance.templateName, step: stepId, iteration: currentIterations + 1, agent: step.agent }, `Started step '${stepId}' (iteration ${currentIterations + 1}) with agent ${step.agent}`);
   return ok(updatedInstance);
 }
 
@@ -203,6 +223,8 @@ export function completeStep(
 
   // Update the record
   const updatedHistory = [...instance.stepHistory];
+  const startedAt = updatedHistory[runningIndex].startedAt;
+  const duration = Date.now() - new Date(startedAt).getTime();
   updatedHistory[runningIndex] = {
     ...updatedHistory[runningIndex],
     completedAt: now(),
@@ -215,6 +237,7 @@ export function completeStep(
     stepHistory: updatedHistory,
   };
 
+  moduleLogger.workflow.info('step_complete', { workflow: instance.templateName, step: stepId, duration: formatDuration(duration), outputType: output?.type }, `Completed step '${stepId}' in ${formatDuration(duration)}`);
   return ok(updatedInstance);
 }
 
@@ -250,6 +273,7 @@ export function failStep(
       },
     };
 
+    moduleLogger.workflow.error('step_failed', { workflow: instance.templateName, step: stepId, error }, `Step '${stepId}' failed: ${error}`);
     return ok({
       ...instance,
       stepHistory: [...instance.stepHistory, record],
@@ -268,6 +292,7 @@ export function failStep(
     },
   };
 
+  moduleLogger.workflow.error('step_failed', { workflow: instance.templateName, step: stepId, error }, `Step '${stepId}' failed: ${error}`);
   return ok({
     ...instance,
     stepHistory: updatedHistory,
@@ -340,6 +365,7 @@ export function transitionWorkflow(
 
   // If no next step, workflow is complete
   if (nextStep === null) {
+    moduleLogger.workflow.info('workflow_complete', { workflow: instance.templateName, status: 'complete' }, `Workflow '${instance.templateName}' completed`);
     return ok({
       ...instance,
       status: 'complete',
@@ -347,6 +373,7 @@ export function transitionWorkflow(
   }
 
   // Update current step
+  moduleLogger.workflow.debug('workflow_transition', { workflow: instance.templateName, from: instance.currentStep, to: nextStep }, `Workflow transitioning from '${instance.currentStep}' to '${nextStep}'`);
   return ok({
     ...instance,
     currentStep: nextStep,
@@ -362,8 +389,9 @@ export function transitionWorkflow(
  */
 export function failWorkflow(
   instance: WorkflowInstance,
-  _reason: string
+  reason: string
 ): WorkflowInstance {
+  moduleLogger.workflow.error('workflow_failed', { workflow: instance.templateName, reason }, `Workflow '${instance.templateName}' failed: ${reason}`);
   return {
     ...instance,
     status: 'failed',
@@ -377,6 +405,8 @@ export function failWorkflow(
  * @returns Updated instance marked as timed out
  */
 export function timeoutWorkflow(instance: WorkflowInstance): WorkflowInstance {
+  const elapsed = Date.now() - new Date(instance.createdAt).getTime();
+  moduleLogger.workflow.error('workflow_timeout', { workflow: instance.templateName, elapsed: formatDuration(elapsed) }, `Workflow '${instance.templateName}' timed out after ${formatDuration(elapsed)}`);
   return {
     ...instance,
     status: 'timeout',

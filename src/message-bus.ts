@@ -21,6 +21,7 @@ import {
   getThreadMessages,
   type CreateMessageInput,
 } from './db.js';
+import { type Logger, createNoopLogger, formatSize } from './logger.js';
 
 // =============================================================================
 // Constants
@@ -38,6 +39,23 @@ export const MAX_INBOX_MESSAGES = 1000; // Max messages per inbox
 export type ValidAgent = typeof VALID_AGENTS[number];
 
 export const PRIORITY_ORDER = ['critical', 'high', 'normal', 'low'] as const;
+
+// =============================================================================
+// Module-Level Logger
+// =============================================================================
+
+/**
+ * Module-level logger instance. Set via setLogger() to enable logging.
+ */
+let moduleLogger: Logger = createNoopLogger();
+
+/**
+ * Set the logger for this module.
+ * Called from swarm.ts during initialization.
+ */
+export function setLogger(logger: Logger): void {
+  moduleLogger = logger;
+}
 
 // =============================================================================
 // Local Types
@@ -93,7 +111,7 @@ function readMessagesFile(path: string): AgentMessage[] {
     // Filter to only valid messages
     return parsed.filter((msg): msg is AgentMessage => validateMessage(msg));
   } catch (error) {
-    console.warn(`[message-bus] Failed to read messages from ${path}:`, error);
+    moduleLogger.messages.warn('message_read_failed', { path, error: String(error) }, `Failed to read messages from ${path}: ${error}`);
     return [];
   }
 }
@@ -326,7 +344,7 @@ function sanitizeAgentName(agent: string): string {
 
   // If sanitization changed the string significantly, it may be an attack
   if (sanitized !== agent) {
-    console.warn(`[message-bus] Agent name sanitized: "${agent}" -> "${sanitized}"`);
+    moduleLogger.messages.warn('agent_name_sanitized', { original: agent, sanitized }, `Agent name sanitized: "${agent}" -> "${sanitized}"`);
   }
 
   return sanitized;
@@ -394,9 +412,7 @@ export function addToInbox(agent: string, message: AgentMessage): void {
     // Enforce inbox size limit by removing oldest messages
     if (messages.length > MAX_INBOX_MESSAGES) {
       const dropped = messages.length - MAX_INBOX_MESSAGES;
-      console.warn(
-        `[message-bus] Inbox for ${agent} exceeded limit, dropping ${dropped} oldest messages`
-      );
+      moduleLogger.messages.warn('inbox_overflow', { agent, dropped, limit: MAX_INBOX_MESSAGES }, `Inbox for ${agent} exceeded limit, dropping ${dropped} oldest messages`);
       messages = messages.slice(-MAX_INBOX_MESSAGES);
     }
 
@@ -538,6 +554,7 @@ export function sendMessage(input: SendMessageInput, options?: SendOptions): Age
   // Validate message size before creating
   const contentSize = JSON.stringify(input.content).length;
   if (contentSize > MAX_MESSAGE_SIZE_BYTES) {
+    moduleLogger.messages.error('message_size_exceeded', { from: input.from, to: input.to, size: formatSize(contentSize), limit: formatSize(MAX_MESSAGE_SIZE_BYTES) }, `Message from ${input.from} to ${input.to} exceeds size limit: ${formatSize(contentSize)}`);
     throw new Error(
       `Message content exceeds maximum size: ${contentSize} bytes > ${MAX_MESSAGE_SIZE_BYTES} bytes`
     );
@@ -556,8 +573,10 @@ export function sendMessage(input: SendMessageInput, options?: SendOptions): Age
         addToInbox(agent, message);
       }
     }
+    moduleLogger.messages.debug('message_broadcast', { from: input.from, type: input.type, id: message.id, size: formatSize(contentSize) }, `Broadcast ${input.type} from ${input.from} (${formatSize(contentSize)})`);
   } else {
     addToInbox(input.to, message);
+    moduleLogger.messages.debug('message_sent', { from: input.from, to: input.to, type: input.type, id: message.id, size: formatSize(contentSize) }, `${input.type} from ${input.from} to ${input.to} (${formatSize(contentSize)})`);
   }
 
   // Optionally persist to database

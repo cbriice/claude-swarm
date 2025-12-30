@@ -22,9 +22,13 @@ import {
 } from './orchestrator.js';
 
 import * as tmux from './managers/tmux.js';
+import * as worktree from './managers/worktree.js';
 import * as messageBus from './message-bus.js';
 import * as db from './db.js';
 import { listWorkflowTemplates } from './workflows/templates.js';
+import { createLogger, type Logger } from './logger.js';
+import { setLogger as setWorkflowLogger } from './workflows/engine.js';
+import { setLogger as setErrorLogger } from './error-handling.js';
 
 // =============================================================================
 // Type Definitions
@@ -114,6 +118,43 @@ interface PrerequisiteCheck {
 
 const SWARM_DIR = '.swarm';
 const VERSION = '1.0.0';
+
+// =============================================================================
+// Logger Initialization
+// =============================================================================
+
+/**
+ * Active logger instance for the current session.
+ */
+let activeLogger: Logger | null = null;
+
+/**
+ * Initialize logging for all modules.
+ * Creates a session-specific logger and sets it in all modules that support logging.
+ */
+function initializeLogging(sessionId: string): Logger {
+  const logger = createLogger(sessionId);
+
+  // Set logger in all modules
+  tmux.setLogger(logger);
+  worktree.setLogger(logger);
+  messageBus.setLogger(logger);
+  setWorkflowLogger(logger);
+  setErrorLogger(logger);
+
+  activeLogger = logger;
+  return logger;
+}
+
+/**
+ * Close the active logger.
+ */
+async function closeLogging(): Promise<void> {
+  if (activeLogger) {
+    await activeLogger.close();
+    activeLogger = null;
+  }
+}
 
 const VALID_WORKFLOWS = ['research', 'implement', 'development', 'review', 'full', 'architecture'];
 
@@ -798,12 +839,20 @@ async function handleStart(args: ParsedArgs): Promise<number> {
   print(`Starting ${workflow} workflow...`);
   print(`Goal: ${goal}`);
 
+  // Generate session ID
+  const sessionId = (args.options['session-id'] as string) || `session_${Date.now()}`;
+
+  // Initialize logging for this session
+  const logger = initializeLogging(sessionId);
+  print(`Logs: logs/${sessionId}/`, 'debug');
+
   // Create orchestrator config
   const orchestratorConfig: OrchestratorConfig = {
-    sessionId: args.options['session-id'] as string | undefined,
+    sessionId,
     workflowTimeout: (args.options['timeout'] as number) || config.defaultTimeout,
     verboseLogging: config.verbose || (args.options['verbose'] as boolean),
     autoCleanup: !args.options['no-cleanup'],
+    logger,
   };
 
   // Create and start orchestrator
@@ -830,6 +879,9 @@ async function handleStart(args: ParsedArgs): Promise<number> {
         clearInterval(checkInterval);
         const finalSession = orchestrator.getSession();
         activeOrchestrator = null;
+
+        // Close logger
+        await closeLogging();
 
         if (finalSession?.result?.success) {
           resolve(EXIT_CODES.SUCCESS);

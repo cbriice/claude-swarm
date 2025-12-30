@@ -19,6 +19,8 @@ import {
   generateId,
 } from './types.js';
 
+import { type Logger, createNoopLogger, formatDuration } from './logger.js';
+
 import * as tmux from './managers/tmux.js';
 import * as worktree from './managers/worktree.js';
 import * as messageBus from './message-bus.js';
@@ -84,12 +86,14 @@ export interface OrchestratorConfig {
   maxAgents?: number;
   /** Retries per agent operation, default 3 */
   maxRetries?: number;
+  /** Logger instance for structured logging */
+  logger?: Logger;
 }
 
 /**
- * Default configuration values.
+ * Default configuration values (excludes logger which is optional).
  */
-const DEFAULT_CONFIG: Required<OrchestratorConfig> = {
+const DEFAULT_CONFIG: Required<Omit<OrchestratorConfig, 'logger'>> = {
   sessionId: '',
   monitorInterval: 5000,
   agentTimeout: 300000,    // 5 minutes
@@ -282,18 +286,19 @@ export class Orchestrator {
   private eventHandlers: Set<EventHandler> = new Set();
   private outboxStates: Map<AgentRole, OutboxState> = new Map();
   private sessionErrors: SessionError[] = [];
-  private _config: Required<OrchestratorConfig>;
+  private _config: Required<Omit<OrchestratorConfig, 'logger'>> & { logger?: Logger };
   private recoveryAttempts: RecoveryAttempt[] = [];
   private attemptHistory: Map<string, number> = new Map();
   private totalRecoveryAttempts: number = 0;
   private swarmErrors: SwarmError[] = [];
+  private logger: Logger;
 
   // Public readonly properties
   public get sessionId(): string {
     return this._config.sessionId || this.session?.id || '';
   }
 
-  public get config(): Required<OrchestratorConfig> {
+  public get config(): Required<Omit<OrchestratorConfig, 'logger'>> & { logger?: Logger } {
     return { ...this._config };
   }
 
@@ -305,6 +310,9 @@ export class Orchestrator {
       ...DEFAULT_CONFIG,
       ...config,
     };
+
+    // Initialize logger (use noop if not provided)
+    this.logger = config?.logger ?? createNoopLogger();
 
     // Register recovery action executors
     this.registerRecoveryExecutors();
@@ -336,9 +344,7 @@ export class Orchestrator {
       // Respawn the agent
       const spawnResult = await this.spawnAgent(role);
       if (spawnResult.ok) {
-        if (this._config.verboseLogging) {
-          console.log(`[orchestrator] Recovery: Respawned agent ${role}`);
-        }
+        this.logger.orchestrator.info('agent_respawn', { agent: role }, `Recovery: Respawned agent ${role}`);
       }
     });
 
@@ -370,9 +376,7 @@ export class Orchestrator {
       if (state) {
         const newMessages = messageBus.getNewOutboxMessages(role, state.lastReadTimestamp);
         if (newMessages.length > 0) {
-          if (this._config.verboseLogging) {
-            console.log(`[orchestrator] Recovery: Found ${newMessages.length} new messages from ${role}`);
-          }
+          this.logger.orchestrator.debug('recovery_messages_found', { agent: role, count: newMessages.length }, `Recovery: Found ${newMessages.length} new messages from ${role}`);
         }
       }
     });
@@ -550,9 +554,7 @@ export class Orchestrator {
       // Emit event
       this.emit({ type: 'session_started', sessionId, workflow: type });
 
-      if (this._config.verboseLogging) {
-        console.log(`[orchestrator] Started workflow '${type}' with session ID: ${sessionId}`);
-      }
+      this.logger.orchestrator.info('session_start', { session: sessionId, workflow: type, agents: roles.length }, `Started workflow '${type}' with session ID: ${sessionId}`);
 
       return ok(this.session);
     } catch (error) {
@@ -678,8 +680,8 @@ export class Orchestrator {
     const retryConfig = { ...RETRY_CONFIGS.agentSpawn };
     const retryResult = await withRetry<ManagedAgent>(
       async (context) => {
-        if (this._config.verboseLogging && context.attempt > 1) {
-          console.log(`[orchestrator] Retry ${context.attempt}/${context.maxAttempts} spawning agent ${role}`);
+        if (context.attempt > 1) {
+          this.logger.orchestrator.warn('agent_spawn_retry', { agent: role, attempt: context.attempt, maxAttempts: context.maxAttempts }, `Retry ${context.attempt}/${context.maxAttempts} spawning agent ${role}`);
         }
 
         const result = await this.doSpawnAgent(role);
@@ -813,9 +815,7 @@ export class Orchestrator {
     agent.status = 'ready';
     this.emit({ type: 'agent_ready', role });
 
-    if (this._config.verboseLogging) {
-      console.log(`[orchestrator] Agent ${role} spawned and ready in pane ${paneId}`);
-    }
+    this.logger.orchestrator.info('agent_ready', { agent: role, pane: paneId }, `Agent ${role} spawned and ready in pane ${paneId}`);
 
     return ok(agent);
   }
@@ -1056,9 +1056,7 @@ export class Orchestrator {
       this._config.monitorInterval
     );
 
-    if (this._config.verboseLogging) {
-      console.log(`[orchestrator] Started monitoring at ${this._config.monitorInterval}ms interval`);
-    }
+    this.logger.orchestrator.debug('monitor_start', { interval: this._config.monitorInterval }, `Started monitoring at ${this._config.monitorInterval}ms interval`);
   }
 
   /**
@@ -1069,9 +1067,7 @@ export class Orchestrator {
       clearInterval(this.monitorIntervalId);
       this.monitorIntervalId = null;
 
-      if (this._config.verboseLogging) {
-        console.log('[orchestrator] Stopped monitoring');
-      }
+      this.logger.orchestrator.debug('monitor_stop', {}, 'Stopped monitoring');
     }
   }
 
@@ -1107,9 +1103,7 @@ export class Orchestrator {
 
       // Check global recovery limits to prevent infinite loops
       if (this.totalRecoveryAttempts >= Orchestrator.MAX_TOTAL_RECOVERY) {
-        if (this._config.verboseLogging) {
-          console.warn(`[orchestrator] Maximum total recovery attempts (${Orchestrator.MAX_TOTAL_RECOVERY}) reached, skipping recovery for ${role}`);
-        }
+        this.logger.orchestrator.warn('recovery_limit_total', { agent: role, limit: Orchestrator.MAX_TOTAL_RECOVERY }, `Maximum total recovery attempts (${Orchestrator.MAX_TOTAL_RECOVERY}) reached, skipping recovery for ${role}`);
         this.recordError({
           timestamp: now(),
           agent: role,
@@ -1125,9 +1119,7 @@ export class Orchestrator {
       const agentRecoveryKey = `recovery:${role}`;
       const agentRecoveryAttempts = this.attemptHistory.get(agentRecoveryKey) ?? 0;
       if (agentRecoveryAttempts >= Orchestrator.MAX_RECOVERY_PER_AGENT) {
-        if (this._config.verboseLogging) {
-          console.warn(`[orchestrator] Maximum recovery attempts for agent ${role} reached, skipping recovery`);
-        }
+        this.logger.orchestrator.warn('recovery_limit_agent', { agent: role, limit: Orchestrator.MAX_RECOVERY_PER_AGENT }, `Maximum recovery attempts for agent ${role} reached, skipping recovery`);
         this.recordError({
           timestamp: now(),
           agent: role,
@@ -1188,9 +1180,9 @@ export class Orchestrator {
           sessionError.recovered = true;
         }
 
-        if (this._config.verboseLogging) {
-          console.log(`[orchestrator] Recovery successful for agent ${role} using strategy: ${recoveryOutcome.strategyUsed}`);
-        }
+        this.logger.orchestrator.info('recovery_success', { agent: role, strategy: recoveryOutcome.strategyUsed }, `Recovery successful for agent ${role} using strategy: ${recoveryOutcome.strategyUsed}`);
+      } else {
+        this.logger.orchestrator.error('recovery_failed', { agent: role, strategy: recoveryOutcome.strategyUsed }, `Recovery failed for agent ${role} using strategy: ${recoveryOutcome.strategyUsed}`);
       }
     }
 
@@ -1353,44 +1345,40 @@ export class Orchestrator {
     for (const agent of this.session.agents.values()) {
       try {
         await this.terminateAgentGracefully(agent);
+        this.logger.orchestrator.debug('agent_terminated', { agent: agent.role }, `Terminated agent ${agent.role}`);
       } catch (error) {
         cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
-        if (this._config.verboseLogging) {
-          console.error(`[orchestrator] Failed to terminate agent ${agent.role}:`, error);
-        }
+        this.logger.orchestrator.error('agent_terminate_failed', { agent: agent.role, error: String(error) }, `Failed to terminate agent ${agent.role}: ${error}`);
       }
     }
 
     // Kill tmux session
     try {
       await tmux.killSession(sessionName);
+      this.logger.orchestrator.debug('tmux_session_killed', { session: sessionName }, `Killed tmux session ${sessionName}`);
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
-      if (this._config.verboseLogging) {
-        console.error(`[orchestrator] Failed to kill tmux session:`, error);
-      }
+      this.logger.orchestrator.error('tmux_kill_failed', { session: sessionName, error: String(error) }, `Failed to kill tmux session: ${error}`);
     }
 
     // Remove worktrees
     try {
       await worktree.removeAllWorktrees({ force: true, deleteBranches: true });
       await worktree.pruneWorktrees();
+      this.logger.orchestrator.debug('worktrees_removed', {}, 'Removed all worktrees');
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
-      if (this._config.verboseLogging) {
-        console.error(`[orchestrator] Failed to remove worktrees:`, error);
-      }
+      this.logger.orchestrator.error('worktrees_remove_failed', { error: String(error) }, `Failed to remove worktrees: ${error}`);
     }
 
     // Clear message queues if autoCleanup
     if (this._config.autoCleanup) {
       try {
         messageBus.clearAllQueues();
+        this.logger.orchestrator.debug('message_queues_cleared', {}, 'Cleared all message queues');
       } catch (error) {
         cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
-        if (this._config.verboseLogging) {
-          console.error(`[orchestrator] Failed to clear message queues:`, error);
-        }
+        this.logger.orchestrator.error('message_queues_clear_failed', { error: String(error) }, `Failed to clear message queues: ${error}`);
       }
     }
 
@@ -1402,9 +1390,7 @@ export class Orchestrator {
       }
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
-      if (this._config.verboseLogging) {
-        console.error(`[orchestrator] Failed to update session status in DB:`, error);
-      }
+      this.logger.orchestrator.error('db_update_failed', { session: sessionId, error: String(error) }, `Failed to update session status in DB: ${error}`);
     }
 
     // Emit session ended event
@@ -1423,12 +1409,10 @@ export class Orchestrator {
     this.attemptHistory.clear();
     this.totalRecoveryAttempts = 0;
 
-    if (this._config.verboseLogging) {
-      if (cleanupErrors.length > 0) {
-        console.warn(`[orchestrator] Cleanup completed with ${cleanupErrors.length} error(s)`);
-      } else {
-        console.log(`[orchestrator] Cleaned up session ${sessionId}`);
-      }
+    if (cleanupErrors.length > 0) {
+      this.logger.orchestrator.warn('session_cleanup', { session: sessionId, errors: cleanupErrors.length }, `Cleanup completed with ${cleanupErrors.length} error(s)`);
+    } else {
+      this.logger.orchestrator.info('session_end', { session: sessionId }, `Cleaned up session ${sessionId}`);
     }
   }
 
@@ -1482,7 +1466,7 @@ export class Orchestrator {
       try {
         handler(event);
       } catch (error) {
-        console.error('[orchestrator] Event handler error:', error);
+        this.logger.orchestrator.error('event_handler_error', { eventType: event.type, error: String(error) }, `Event handler error: ${error}`);
       }
     }
   }
@@ -1683,9 +1667,7 @@ export class Orchestrator {
       messageType: decision.message.type,
     });
 
-    if (this._config.verboseLogging) {
-      console.log(`[orchestrator] Routed ${decision.message.type} from ${from} to ${decision.to}`);
-    }
+    this.logger.orchestrator.debug('message_routed', { from, to: decision.to, type: decision.message.type }, `Routed ${decision.message.type} from ${from} to ${decision.to}`);
   }
 
   /**
@@ -1709,9 +1691,8 @@ export class Orchestrator {
       await this.cleanup();
     }
 
-    if (this._config.verboseLogging) {
-      console.log('[orchestrator] Workflow completed successfully');
-    }
+    const duration = this.session ? Date.now() - new Date(this.session.startedAt).getTime() : 0;
+    this.logger.orchestrator.info('workflow_complete', { success: true, duration: formatDuration(duration) }, 'Workflow completed successfully');
   }
 
   /**
@@ -1721,6 +1702,9 @@ export class Orchestrator {
     if (!this.session) {
       return;
     }
+
+    const duration = Date.now() - new Date(this.session.startedAt).getTime();
+    this.logger.orchestrator.error('workflow_timeout', { duration: formatDuration(duration), timeout: formatDuration(this._config.workflowTimeout) }, `Workflow timed out after ${formatDuration(duration)}`);
 
     this.stopMonitoring();
     this.session.status = 'failed';
@@ -1748,9 +1732,7 @@ export class Orchestrator {
       this.emit({ type: 'agent_error', role: error.agent, error: error.message });
     }
 
-    if (this._config.verboseLogging) {
-      console.error(`[orchestrator] Error: ${error.message}`);
-    }
+    this.logger.orchestrator.error('session_error', { type: error.type, agent: error.agent, recoverable: error.recoverable }, error.message);
   }
 
   /**
@@ -1826,14 +1808,10 @@ export class Orchestrator {
         recoveryAttempts: this.recoveryAttempts,
       });
 
-      if (this._config.verboseLogging) {
-        console.log(`[orchestrator] Created checkpoint for stage: ${stageName}`);
-      }
+      this.logger.orchestrator.debug('checkpoint_created', { stage: stageName }, `Created checkpoint for stage: ${stageName}`);
     } catch (error) {
       // Log but don't fail the workflow on checkpoint errors
-      if (this._config.verboseLogging) {
-        console.error(`[orchestrator] Failed to create checkpoint: ${error}`);
-      }
+      this.logger.orchestrator.warn('checkpoint_failed', { stage: stageName, error: String(error) }, `Failed to create checkpoint: ${error}`);
     }
   }
 

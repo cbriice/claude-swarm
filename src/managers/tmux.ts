@@ -6,6 +6,7 @@
  */
 
 import { Result, ok, err } from '../types.js';
+import { type Logger, createNoopLogger, formatDuration, truncateOutput } from '../logger.js';
 
 // =============================================================================
 // Type Definitions
@@ -130,6 +131,23 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30000; // 30 seconds default timeout for tmux
 const PANE_ID_PATTERN = /^%\d+$/;
 
 // =============================================================================
+// Module-Level Logger
+// =============================================================================
+
+/**
+ * Module-level logger instance. Set via setLogger() to enable logging.
+ */
+let moduleLogger: Logger = createNoopLogger();
+
+/**
+ * Set the logger for this module.
+ * Called from swarm.ts during initialization.
+ */
+export function setLogger(logger: Logger): void {
+  moduleLogger = logger;
+}
+
+// =============================================================================
 // Internal Helpers
 // =============================================================================
 
@@ -189,6 +207,11 @@ async function runTmux(
   args: string[],
   timeoutMs: number = DEFAULT_COMMAND_TIMEOUT_MS
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const startTime = Date.now();
+  const commandStr = `tmux ${args.join(' ')}`;
+
+  moduleLogger.subprocess.debug('cmd_start', { command: 'tmux', args: args.join(' ') }, `Executing: ${commandStr}`);
+
   const proc = Bun.spawn(['tmux', ...args], {
     stdout: 'pipe',
     stderr: 'pipe',
@@ -213,10 +236,21 @@ async function runTmux(
       timeoutPromise,
     ]);
 
-    return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+    const duration = Date.now() - startTime;
+    const result = { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+
+    if (exitCode === 0) {
+      moduleLogger.subprocess.debug('cmd_complete', { command: 'tmux', exitCode, duration: formatDuration(duration), outputLen: stdout.length }, `Completed: ${commandStr} (${formatDuration(duration)})`);
+    } else {
+      moduleLogger.subprocess.warn('cmd_failed', { command: 'tmux', exitCode, duration: formatDuration(duration), stderr: truncateOutput(result.stderr, 500) }, `Failed: ${commandStr} - ${truncateOutput(result.stderr, 200)}`);
+    }
+
+    return result;
   } catch (error) {
+    const duration = Date.now() - startTime;
     // If timeout occurred, return an error result
     if (error instanceof Error && error.message.includes('timed out')) {
+      moduleLogger.subprocess.error('cmd_timeout', { command: 'tmux', timeout: timeoutMs, duration: formatDuration(duration) }, `Timeout: ${commandStr} after ${formatDuration(duration)}`);
       return {
         exitCode: -1,
         stdout: '',
@@ -325,6 +359,7 @@ export async function createSession(name: string): Promise<Result<void, TmuxErro
     return err(createTmuxError('COMMAND_FAILED', `Failed to create session '${name}'`, result.stderr));
   }
 
+  moduleLogger.subprocess.info('session_created', { session: name }, `Created tmux session: ${name}`);
   return ok(undefined);
 }
 
@@ -338,11 +373,13 @@ export async function killSession(name: string): Promise<Result<void, TmuxError>
   // Treat "session not found" and "no server running" as success (idempotent)
   if (result.exitCode !== 0) {
     if (result.stderr.includes("can't find session") || result.stderr.includes('no server running')) {
+      moduleLogger.subprocess.debug('session_not_found', { session: name }, `Session ${name} not found (already killed)`);
       return ok(undefined);
     }
     return err(createTmuxError('COMMAND_FAILED', `Failed to kill session '${name}'`, result.stderr));
   }
 
+  moduleLogger.subprocess.info('session_killed', { session: name }, `Killed tmux session: ${name}`);
   return ok(undefined);
 }
 
@@ -440,6 +477,7 @@ export async function createPane(
     await runTmux(['select-pane', '-t', `${sessionName}:${paneId}`, '-T', options.name]);
   }
 
+  moduleLogger.subprocess.info('pane_created', { session: sessionName, pane: paneId, name: options?.name }, `Created pane ${paneId}${options?.name ? ` (${options.name})` : ''} in session ${sessionName}`);
   return ok(paneId);
 }
 
@@ -572,6 +610,7 @@ export async function killPane(
     return err(createTmuxError('COMMAND_FAILED', 'Failed to kill pane', result.stderr));
   }
 
+  moduleLogger.subprocess.debug('pane_killed', { pane: paneId }, `Killed pane ${paneId}`);
   return ok(undefined);
 }
 
@@ -801,6 +840,8 @@ export async function startClaudeCode(
   paneId: string,
   options?: ClaudeCodeOptions
 ): Promise<Result<void, TmuxError>> {
+  moduleLogger.subprocess.info('claude_code_start', { session: sessionName, pane: paneId, workdir: options?.workdir, resume: options?.resume }, `Starting Claude Code in pane ${paneId}`);
+
   // Change directory if specified
   if (options?.workdir) {
     // Validate path to prevent shell injection
@@ -826,7 +867,11 @@ export async function startClaudeCode(
     command += ` -p "${escapedPrompt}"`;
   }
 
-  return runCommand(sessionName, paneId, command);
+  const result = await runCommand(sessionName, paneId, command);
+  if (result.ok) {
+    moduleLogger.subprocess.debug('claude_code_started', { session: sessionName, pane: paneId, command }, `Claude Code started with command: ${command}`);
+  }
+  return result;
 }
 
 /**

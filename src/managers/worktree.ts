@@ -9,6 +9,7 @@
 import { existsSync, copyFileSync, rmSync, mkdirSync, readdirSync } from 'fs';
 import { join, resolve } from 'path';
 import { Result, ok, err, type AgentRole } from '../types.js';
+import { type Logger, createNoopLogger, formatDuration, truncateOutput } from '../logger.js';
 
 // =============================================================================
 // Constants
@@ -22,6 +23,23 @@ export const VALID_ROLES: AgentRole[] = ['orchestrator', 'researcher', 'develope
 // Valid session ID pattern: alphanumeric, underscore, hyphen only (for safe branch names)
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const DEFAULT_COMMAND_TIMEOUT_MS = 30000; // 30 seconds default timeout for git commands
+
+// =============================================================================
+// Module-Level Logger
+// =============================================================================
+
+/**
+ * Module-level logger instance. Set via setLogger() to enable logging.
+ */
+let moduleLogger: Logger = createNoopLogger();
+
+/**
+ * Set the logger for this module.
+ * Called from swarm.ts during initialization.
+ */
+export function setLogger(logger: Logger): void {
+  moduleLogger = logger;
+}
 
 // =============================================================================
 // Type Definitions
@@ -115,6 +133,11 @@ async function runGit(
   cwd?: string,
   timeoutMs: number = DEFAULT_COMMAND_TIMEOUT_MS
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const startTime = Date.now();
+  const commandStr = `git ${args.join(' ')}`;
+
+  moduleLogger.subprocess.debug('cmd_start', { command: 'git', args: args.join(' '), cwd }, `Executing: ${commandStr}`);
+
   const proc = Bun.spawn(['git', ...args], {
     stdout: 'pipe',
     stderr: 'pipe',
@@ -140,10 +163,21 @@ async function runGit(
       timeoutPromise,
     ]);
 
-    return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+    const duration = Date.now() - startTime;
+    const result = { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+
+    if (exitCode === 0) {
+      moduleLogger.subprocess.debug('cmd_complete', { command: 'git', exitCode, duration: formatDuration(duration), outputLen: stdout.length }, `Completed: ${commandStr} (${formatDuration(duration)})`);
+    } else {
+      moduleLogger.subprocess.warn('cmd_failed', { command: 'git', exitCode, duration: formatDuration(duration), stderr: truncateOutput(result.stderr, 500) }, `Failed: ${commandStr} - ${truncateOutput(result.stderr, 200)}`);
+    }
+
+    return result;
   } catch (error) {
+    const duration = Date.now() - startTime;
     // If timeout occurred, return an error result
     if (error instanceof Error && error.message.includes('timed out')) {
+      moduleLogger.subprocess.error('cmd_timeout', { command: 'git', timeout: timeoutMs, duration: formatDuration(duration) }, `Timeout: ${commandStr} after ${formatDuration(duration)}`);
       return {
         exitCode: -1,
         stdout: '',
@@ -504,6 +538,7 @@ export async function createWorktree(
     }
   }
 
+  moduleLogger.subprocess.info('worktree_created', { role, branch: branchName, path: worktreePath }, `Created worktree for ${role} at ${worktreePath}`);
   return ok(worktreePath);
 }
 
@@ -543,6 +578,7 @@ export async function createWorktrees(
     createdWorktrees.set(role, result.value);
   }
 
+  moduleLogger.subprocess.info('worktrees_created', { count: createdWorktrees.size, roles: roles.join(',') }, `Created ${createdWorktrees.size} worktrees for roles: ${roles.join(', ')}`);
   return ok(createdWorktrees);
 }
 
@@ -683,6 +719,7 @@ export async function removeWorktree(
     // Ignore branch deletion errors (branch may not exist)
   }
 
+  moduleLogger.subprocess.debug('worktree_removed', { role, branch: branchName, path: worktreePath }, `Removed worktree for ${role}`);
   return ok(undefined);
 }
 
@@ -721,6 +758,11 @@ export async function removeAllWorktrees(
     }
   }
 
+  if (failedRoles.length > 0) {
+    moduleLogger.subprocess.warn('worktrees_removed', { success: successCount, failed: failedRoles.length }, `Removed ${successCount} worktrees, ${failedRoles.length} failed`);
+  } else {
+    moduleLogger.subprocess.info('worktrees_removed', { count: successCount }, `Removed all ${successCount} worktrees`);
+  }
   return ok({ successCount, failedRoles });
 }
 

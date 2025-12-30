@@ -14,6 +14,24 @@ import {
 } from './types.js';
 
 import { getDb } from './db.js';
+import { type Logger, createNoopLogger } from './logger.js';
+
+// =============================================================================
+// Module-Level Logger
+// =============================================================================
+
+/**
+ * Module-level logger instance. Set via setLogger() to enable logging.
+ */
+let moduleLogger: Logger = createNoopLogger();
+
+/**
+ * Set the logger for this module.
+ * Called from swarm.ts during initialization.
+ */
+export function setLogger(logger: Logger): void {
+  moduleLogger = logger;
+}
 
 // =============================================================================
 // Safe JSON Utilities
@@ -75,7 +93,7 @@ function safeJsonParse<T>(json: string | null | undefined, defaultValue: T): T {
   try {
     return JSON.parse(json) as T;
   } catch {
-    console.error(`[error-handling] Failed to parse JSON: ${json.substring(0, 100)}...`);
+    moduleLogger.orchestrator.warn('json_parse_failed', {}, `Failed to parse JSON: ${json.substring(0, 100)}...`);
     return defaultValue;
   }
 }
@@ -1222,9 +1240,9 @@ export async function executeAction(
       // Emit notification - in the future this could integrate with external systems
       const message = `[Recovery] ${action.description}: ${error.code} - ${error.message}`;
       if (error.agentRole) {
-        console.log(`[notify] Agent ${error.agentRole}: ${message}`);
+        moduleLogger.orchestrator.info('recovery_notify', { agent: error.agentRole, code: error.code }, `Agent ${error.agentRole}: ${message}`);
       } else {
-        console.log(`[notify] ${message}`);
+        moduleLogger.orchestrator.info('recovery_notify', { code: error.code }, message);
       }
       break;
     }
@@ -1237,7 +1255,7 @@ export async function executeAction(
       } else {
         // Log the intent for actions without registered executors
         // This allows the orchestrator to handle specific actions
-        console.log(`[execute] Recovery action: ${action.description}`);
+        moduleLogger.orchestrator.debug('recovery_execute', { action: action.description }, `Recovery action: ${action.description}`);
       }
       break;
     }
@@ -1249,7 +1267,7 @@ export async function executeAction(
         await cleanupExecutor(action, error, context);
       } else {
         // Log cleanup intent
-        console.log(`[cleanup] Recovery cleanup: ${action.description}`);
+        moduleLogger.orchestrator.debug('recovery_cleanup', { action: action.description }, `Recovery cleanup: ${action.description}`);
       }
       break;
     }
@@ -2106,15 +2124,13 @@ export async function recoverSession(
   };
 
   // Log successful recovery preparation
-  const recoveryLogMessage = [
-    `Prepared recovery from checkpoint ${checkpoint.id}`,
-    `Completed stages: ${checkpoint.completedStages.length}`,
-    `Pending stages: ${restoredState.pendingStages as string[]}`,
-    `Agents to restore: ${Object.keys(agentsToRestore).length}`,
-    `Agents to reset: ${agentsToReset.length}`,
-  ].join(', ');
-
-  console.log(`[recovery] ${recoveryLogMessage}`);
+  moduleLogger.orchestrator.info('session_recovery', {
+    checkpoint: checkpoint.id,
+    completedStages: checkpoint.completedStages.length,
+    pendingStages: (restoredState.pendingStages as string[]).length,
+    agentsToRestore: Object.keys(agentsToRestore).length,
+    agentsToReset: agentsToReset.length,
+  }, `Prepared recovery from checkpoint ${checkpoint.id} - ${checkpoint.completedStages.length} completed, ${(restoredState.pendingStages as string[]).length} pending`);
 
   return {
     success: true,
