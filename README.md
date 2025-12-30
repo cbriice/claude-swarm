@@ -6,6 +6,10 @@ A lightweight multi-agent orchestration system for Claude Code instances. Enable
 
 This codebase is the result of me experimenting with greater levels of autonomy in medium-scale project development with Claude Code, including heavy usage of subagents to do what I would previously have done with a single instance and me reviewing/signing off on each change. In my work for Intentia, for example, I develope architecture myself and so have a much greater say in controlling Claude's output. Conversely, in this codebase I let Claude do most if not all of the heavy lifting in all aspects from architecture development to testing/review/bugfixes, with me simply guiding it in the direction I want the project to go with my knowledge of what features are necessary that were likely overlooked or not properly taken care of.
 
+**End result**
+
+The project was an interesting concept but ultimately a failure. Despite all my efforts to optimize behavior and use the backend to manage agents, claude code cli is just not built for automation. Every run got stuck with a claude waiting for a human-in-the-loop prompt, the worktrees were clunky and clogged with top-level project context and model output for basic tasks like research was unable to be caught and stored efficiently, and the overall behavior of claude code is evidently more optimized for human interface than automation (something that is retrospectively obvious but I thought I could circumvent with clever architecture). 
+
 
 ## Architecture
 
