@@ -468,6 +468,7 @@ export class Orchestrator {
 
     // Store session in database
     db.createSession({
+      id: sessionId,
       workflowType: type as 'research' | 'development' | 'architecture',
       goal,
     });

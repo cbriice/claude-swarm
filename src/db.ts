@@ -357,6 +357,7 @@ export interface MessageRow {
 // =============================================================================
 
 export interface CreateSessionInput {
+  id?: string;  // Optional - if not provided, one will be generated
   workflowType: WorkflowType;
   goal: string;
 }
@@ -601,7 +602,7 @@ export function createSession(input: CreateSessionInput): SwarmSession {
   requireValidEnum(input.workflowType, VALID_WORKFLOW_TYPES, 'workflowType');
 
   const db = getDb();
-  const id = generateId();
+  const id = input.id || generateId();
   const timestamp = now();
 
   db.run(
