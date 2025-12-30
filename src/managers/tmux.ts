@@ -140,6 +140,14 @@ const PANE_ID_PATTERN = /^%\d+$/;
 let moduleLogger: Logger = createNoopLogger();
 
 /**
+ * Poll batching state - reduces log noise from capture-pane polling.
+ * Logs a summary every POLL_LOG_INTERVAL_MS instead of every poll.
+ */
+const POLL_LOG_INTERVAL_MS = 5000;
+let pollCount = 0;
+let pollLastLogTime = 0;
+
+/**
  * Set the logger for this module.
  * Called from swarm.ts during initialization.
  */
@@ -210,7 +218,19 @@ async function runTmux(
   const startTime = Date.now();
   const commandStr = `tmux ${args.join(' ')}`;
 
-  moduleLogger.subprocess.debug('cmd_start', { command: 'tmux', args: args.join(' ') }, `Executing: ${commandStr}`);
+  // Batch capture-pane polling logs to reduce noise
+  const isCapturePaneCmd = args[0] === 'capture-pane';
+  if (isCapturePaneCmd) {
+    pollCount++;
+    const now = Date.now();
+    if (now - pollLastLogTime >= POLL_LOG_INTERVAL_MS) {
+      moduleLogger.subprocess.debug('poll_batch', { command: 'capture-pane', count: pollCount, interval: '5s' }, `Polled ${pollCount} times in last 5s`);
+      pollCount = 0;
+      pollLastLogTime = now;
+    }
+  } else {
+    moduleLogger.subprocess.debug('cmd_start', { command: 'tmux', args: args.join(' ') }, `Executing: ${commandStr}`);
+  }
 
   const proc = Bun.spawn(['tmux', ...args], {
     stdout: 'pipe',
@@ -239,8 +259,11 @@ async function runTmux(
     const duration = Date.now() - startTime;
     const result = { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
 
+    // Skip completion logs for capture-pane (already batched), unless it failed
     if (exitCode === 0) {
-      moduleLogger.subprocess.debug('cmd_complete', { command: 'tmux', exitCode, duration: formatDuration(duration), outputLen: stdout.length }, `Completed: ${commandStr} (${formatDuration(duration)})`);
+      if (!isCapturePaneCmd) {
+        moduleLogger.subprocess.debug('cmd_complete', { command: 'tmux', exitCode, duration: formatDuration(duration), outputLen: stdout.length }, `Completed: ${commandStr} (${formatDuration(duration)})`);
+      }
     } else {
       moduleLogger.subprocess.warn('cmd_failed', { command: 'tmux', exitCode, duration: formatDuration(duration), stderr: truncateOutput(result.stderr, 500) }, `Failed: ${commandStr} - ${truncateOutput(result.stderr, 200)}`);
     }

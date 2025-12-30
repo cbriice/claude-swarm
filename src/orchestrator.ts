@@ -768,6 +768,7 @@ export class Orchestrator {
 
     this.session.agents.set(role, agent);
     this.emit({ type: 'agent_spawned', role, paneId });
+    this.logger.orchestrator.info('agent_spawn', { agent: role, pane: paneId }, `Spawning agent ${role} in pane ${paneId}`);
 
     // Initialize outbox state
     this.outboxStates.set(role, {
