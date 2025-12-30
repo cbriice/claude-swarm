@@ -538,6 +538,21 @@ export async function createWorktree(
     }
   }
 
+  // Copy Claude settings if they exist in the main repo
+  const claudeSettingsSource = join(root, '.claude', 'settings.local.json');
+  if (existsSync(claudeSettingsSource)) {
+    const claudeDir = join(worktreePath, '.claude');
+    if (!existsSync(claudeDir)) {
+      mkdirSync(claudeDir, { recursive: true });
+    }
+    try {
+      copyFileSync(claudeSettingsSource, join(claudeDir, 'settings.local.json'));
+    } catch (error) {
+      // Non-fatal - just log and continue
+      moduleLogger.subprocess.warn('claude_settings_copy_failed', { role, error: String(error) }, `Failed to copy Claude settings: ${error}`);
+    }
+  }
+
   moduleLogger.subprocess.info('worktree_created', { role, branch: branchName, path: worktreePath }, `Created worktree for ${role} at ${worktreePath}`);
   return ok(worktreePath);
 }
