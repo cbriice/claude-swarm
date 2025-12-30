@@ -6,7 +6,7 @@
  * preventing file conflicts when multiple Claude Code instances work simultaneously.
  */
 
-import { existsSync, copyFileSync, rmSync, mkdirSync, readdirSync } from 'fs';
+import { existsSync, copyFileSync, rmSync, mkdirSync, readdirSync, symlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { Result, ok, err, type AgentRole } from '../types.js';
 import { type Logger, createNoopLogger, formatDuration, truncateOutput } from '../logger.js';
@@ -550,6 +550,31 @@ export async function createWorktree(
     } catch (error) {
       // Non-fatal - just log and continue
       moduleLogger.subprocess.warn('claude_settings_copy_failed', { role, error: String(error) }, `Failed to copy Claude settings: ${error}`);
+    }
+  }
+
+  // Create symlink to main repo's .swarm directory for messaging
+  const mainSwarmDir = join(root, '.swarm');
+  const worktreeSwarmLink = join(worktreePath, '.swarm');
+  if (existsSync(mainSwarmDir) && !existsSync(worktreeSwarmLink)) {
+    try {
+      symlinkSync(mainSwarmDir, worktreeSwarmLink);
+      moduleLogger.subprocess.debug('swarm_symlink_created', { role, target: mainSwarmDir }, `Created .swarm symlink in worktree`);
+    } catch (error) {
+      moduleLogger.subprocess.warn('swarm_symlink_failed', { role, error: String(error) }, `Failed to create .swarm symlink: ${error}`);
+    }
+  }
+
+  // Clean up swarm infrastructure files - agents should only see their task, not the orchestration code
+  const filesToRemove = ['src', 'docs', 'README.md', 'package.json', 'tsconfig.json', 'bun.lock', 'roles', 'logs'];
+  for (const file of filesToRemove) {
+    const filePath = join(worktreePath, file);
+    if (existsSync(filePath)) {
+      try {
+        rmSync(filePath, { recursive: true, force: true });
+      } catch (error) {
+        moduleLogger.subprocess.warn('cleanup_failed', { role, file, error: String(error) }, `Failed to remove ${file}: ${error}`);
+      }
     }
   }
 
