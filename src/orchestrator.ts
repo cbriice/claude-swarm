@@ -790,9 +790,8 @@ export class Orchestrator {
       lastMessageCount: 0,
     });
 
-    // Start Claude Code in the pane
+    // Start Claude Code in the pane (don't use resume - agents start fresh each session)
     const startResult = await tmux.startClaudeCode(sessionName, paneId, {
-      resume: true,
       workdir: worktreePath,
     });
 
